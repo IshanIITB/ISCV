@@ -1,0 +1,42 @@
+camera:
+  id: camera_01
+  foot_point_proxy: bottom_center
+  calibration_date: "2026-10-09"
+calibration:
+  json_path: config/calibration.json
+  max_error_cm: 30
+  trust_error_threshold_cm: 30
+detection:
+  stride: 2
+  confidence: 0.35
+  model:
+    weights: yolo11n.pt
+    confidence: 0.35
+    image_size: 640
+    device: null
+tracking:
+  minimum_track_length: 8
+  maximum_gap: 15
+zone_settings:
+  buffer_m: 0.15
+motion:
+  window_seconds: 1.5
+  stop_speed_mps: 0.3
+  min_stop_seconds: 3.0
+flags:
+  density_threshold: 1.0
+  speed_threshold_mps: 0.25
+  persistence_seconds: 180
+zones:
+  - name: entrance
+    type: entrance
+    polygon: [[0,0],[4,0],[4,3],[0,3]]
+  - name: browse
+    type: browse
+    polygon: [[4,0],[8,0],[8,4],[4,4]]
+  - name: queue
+    type: queue
+    polygon: [[0,3],[4,3],[4,6],[0,6]]
+  - name: dead_zone
+    type: browse
+    polygon: [[8,0],[12,0],[12,4],[8,4]]
