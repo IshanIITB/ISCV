@@ -8,9 +8,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Polygon
 from scipy.ndimage import gaussian_filter, label as nd_label
 from PIL import Image
+OUTPUT_DIR = Path("outputs")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(page_title="StoreFlow | Dwell-Time Analytics", page_icon="🗺️", layout="wide")
 
@@ -110,17 +112,92 @@ def draw_density(ax, density, xe, ye, background=None):
     plt.colorbar(mesh, ax=ax, label="Relative presence (observations, not unique visitors)",
                  fraction=0.035, pad=0.02)
 
+#original
+# def draw_areas(ax, at, areas, labels=True):
+#     status = dict(zip(at["Area"], at["Status"])) if len(at) else {}
+#     for a in areas:
+#         x1, y1, x2, y2 = a["bounds"]
+#         col = STATUS_COLOR.get(status.get(a["name"]), "#655847")
+#         ax.add_patch(Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor=col, linewidth=2.2))
+#         if labels:
+#             ax.text((x1 + x2) / 2, (y1 + y2) / 2, a["name"], ha="center", va="center",
+#                     fontsize=9, color="#382719",
+#                     bbox=dict(facecolor="#fff4d8", alpha=0.92, edgecolor="#d8b477", boxstyle="round,pad=0.3"))
 
+#verison1
 def draw_areas(ax, at, areas, labels=True):
     status = dict(zip(at["Area"], at["Status"])) if len(at) else {}
+
     for a in areas:
-        x1, y1, x2, y2 = a["bounds"]
-        col = STATUS_COLOR.get(status.get(a["name"]), "#655847")
-        ax.add_patch(Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor=col, linewidth=2.2))
+        col = STATUS_COLOR.get(
+            status.get(a["name"]), "#655847"
+        )
+
+        if "polygon" in a:
+            points = np.asarray(
+                a["polygon"], dtype=np.float32
+            ).reshape((-1, 2))
+
+            if len(points) < 3:
+                continue
+
+            ax.add_patch(
+                Polygon(
+                    points,
+                    closed=True,
+                    fill=False,
+                    edgecolor=col,
+                    linewidth=2.2
+                )
+            )
+
+            # Use the polygon centroid for the label.
+            contour = points.reshape((-1, 1, 2))
+            moments = cv2.moments(contour)
+
+            if moments["m00"] != 0:
+                cx = moments["m10"] / moments["m00"]
+                cy = moments["m01"] / moments["m00"]
+            else:
+                cx, cy = points.mean(axis=0)
+
+        elif "bounds" in a:
+            x1, y1, x2, y2 = a["bounds"]
+
+            ax.add_patch(
+                Rectangle(
+                    (x1, y1),
+                    x2 - x1,
+                    y2 - y1,
+                    fill=False,
+                    edgecolor=col,
+                    linewidth=2.2
+                )
+            )
+
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+
+        else:
+            continue
+
         if labels:
-            ax.text((x1 + x2) / 2, (y1 + y2) / 2, a["name"], ha="center", va="center",
-                    fontsize=9, color="#382719",
-                    bbox=dict(facecolor="#fff4d8", alpha=0.92, edgecolor="#d8b477", boxstyle="round,pad=0.3"))
+            ax.text(
+                cx,
+                cy,
+                a["name"],
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="#382719",
+                bbox=dict(
+                    facecolor="#fff4d8",
+                    alpha=0.92,
+                    edgecolor="#d8b477",
+                    boxstyle="round,pad=0.3"
+                )
+            )
+
 
 
 def fig_to_pil(fig):
@@ -138,12 +215,89 @@ def shrink(img, max_side=MAX_IMG_SIDE):
 # =========================================================
 # VIDEO PROCESSING
 # =========================================================
+
+#otgina;
+
+# def process_video(video_bytes, filename, sample_fps=5):
+#     from ultralytics import YOLO
+
+#     video_path, cap = None, None
+#     try:
+#         with tempfile.NamedTemporaryFile(suffix=Path(filename).suffix or ".mp4", delete=False) as temp:
+#             temp.write(video_bytes)
+#             video_path = temp.name
+
+#         cap = cv2.VideoCapture(video_path)
+#         if not cap.isOpened():
+#             raise RuntimeError("Could not open the uploaded video.")
+
+#         fps = cap.get(cv2.CAP_PROP_FPS)
+#         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+#         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+#         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+#         if not np.isfinite(fps) or fps <= 0 or total <= 0:
+#             raise RuntimeError("Video metadata is invalid.")
+
+#         duration = total / fps
+#         model = YOLO("yolo11n.pt")
+#         rows, unique_ids = [], set()
+#         preview, clean, objects = None, None, []
+#         frame_no = 0
+#         stride = max(1, round(fps / sample_fps))
+#         progress, status = st.progress(0), st.empty()
+
+#         while True:
+#             ok, frame = cap.read()
+#             if not ok:
+#                 break
+#             if frame_no % stride == 0:
+#                 result = model.track(frame, persist=True, tracker="bytetrack.yaml",
+#                                      classes=[0], conf=0.35, verbose=False)[0]
+#                 boxes = result.boxes
+#                 if boxes is not None and len(boxes) > 0:
+#                     coords = boxes.xyxy.cpu().numpy()
+#                     ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [-1] * len(coords)
+#                     for box, tid in zip(coords, ids):
+#                         rows.append({"timestamp": frame_no / fps, "track_id": int(tid),
+#                                      "x_px": float((box[0] + box[2]) / 2), "y_px": float(box[3])})
+#                         if tid >= 0:
+#                             unique_ids.add(tid)
+#                 if preview is None:
+#                     preview = cv2.cvtColor(result.plot(), cv2.COLOR_BGR2RGB)
+#                     clean = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+#                     fr = model.predict(frame, classes=[72], conf=0.25, verbose=False)[0]  # refrigerator
+#                     objects = [{"name": "Fridge", "bounds": tuple(map(float, b))}
+#                                for b in fr.boxes.xyxy.cpu().numpy()]
+#             frame_no += 1
+#             if frame_no % 10 == 0:
+#                 progress.progress(min(frame_no / total, 1.0))
+#                 status.write(f"Processing {frame_no:,}/{total:,} frames")
+
+#         progress.progress(1.0)
+#         cap.release()
+#         cap = None
+#         if not rows:
+#             raise RuntimeError("No people were detected. Try a clearer video.")
+#         return (pd.DataFrame(rows), width, height, fps, duration, len(unique_ids), preview, clean, objects)
+#     finally:
+#         if cap is not None:
+#             cap.release()
+#         if video_path and Path(video_path).exists():
+#             Path(video_path).unlink(missing_ok=True)
+
+#v1
+
 def process_video(video_bytes, filename, sample_fps=5):
     from ultralytics import YOLO
 
-    video_path, cap = None, None
+    video_path, cap, writer = None, None, None
+    output_path = OUTPUT_DIR / f"processed_{Path(filename).stem}.mp4"
+
     try:
-        with tempfile.NamedTemporaryFile(suffix=Path(filename).suffix or ".mp4", delete=False) as temp:
+        with tempfile.NamedTemporaryFile(
+            suffix=Path(filename).suffix or ".mp4",
+            delete=False
+        ) as temp:
             temp.write(video_bytes)
             video_path = temp.name
 
@@ -155,107 +309,379 @@ def process_video(video_bytes, filename, sample_fps=5):
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
         if not np.isfinite(fps) or fps <= 0 or total <= 0:
             raise RuntimeError("Video metadata is invalid.")
 
         duration = total / fps
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            str(output_path), fourcc, fps, (width, height)
+        )
+
+        if not writer.isOpened():
+            raise RuntimeError(
+                "Could not create the output MP4. "
+                "Check OpenCV video codec support."
+            )
+
         model = YOLO("yolo11n.pt")
         rows, unique_ids = [], set()
         preview, clean, objects = None, None, []
         frame_no = 0
         stride = max(1, round(fps / sample_fps))
+
+        # Reuse the most recent detection result on intermediate frames.
+        last_annotated = None
+
         progress, status = st.progress(0), st.empty()
 
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
+
             if frame_no % stride == 0:
-                result = model.track(frame, persist=True, tracker="bytetrack.yaml",
-                                     classes=[0], conf=0.35, verbose=False)[0]
+                result = model.track(
+                    frame,
+                    persist=True,
+                    tracker="bytetrack.yaml",
+                    classes=[0],
+                    conf=0.35,
+                    verbose=False,
+                )[0]
+
+                last_annotated = result.plot()
+
                 boxes = result.boxes
                 if boxes is not None and len(boxes) > 0:
                     coords = boxes.xyxy.cpu().numpy()
-                    ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [-1] * len(coords)
+                    ids = (
+                        boxes.id.int().cpu().tolist()
+                        if boxes.id is not None
+                        else [-1] * len(coords)
+                    )
+
                     for box, tid in zip(coords, ids):
-                        rows.append({"timestamp": frame_no / fps, "track_id": int(tid),
-                                     "x_px": float((box[0] + box[2]) / 2), "y_px": float(box[3])})
+                        rows.append({
+                            "timestamp": frame_no / fps,
+                            "track_id": int(tid),
+                            "x_px": float((box[0] + box[2]) / 2),
+                            "y_px": float(box[3]),
+                        })
                         if tid >= 0:
                             unique_ids.add(tid)
+
                 if preview is None:
-                    preview = cv2.cvtColor(result.plot(), cv2.COLOR_BGR2RGB)
+                    preview = cv2.cvtColor(
+                        last_annotated, cv2.COLOR_BGR2RGB
+                    )
                     clean = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    fr = model.predict(frame, classes=[72], conf=0.25, verbose=False)[0]  # refrigerator
-                    objects = [{"name": "Fridge", "bounds": tuple(map(float, b))}
-                               for b in fr.boxes.xyxy.cpu().numpy()]
+
+                    fr = model.predict(
+                        frame,
+                        classes=[72],
+                        conf=0.25,
+                        verbose=False,
+                    )[0]
+
+                    objects = [
+                        {
+                            "name": "Fridge",
+                            "bounds": tuple(map(float, b)),
+                        }
+                        for b in fr.boxes.xyxy.cpu().numpy()
+                    ]
+
+            # Write every frame, keeping the original FPS and duration.
+            # Frames between detection steps have no fresh detections.
+            writer.write(
+                last_annotated if last_annotated is not None else frame
+            )
+
             frame_no += 1
+
             if frame_no % 10 == 0:
                 progress.progress(min(frame_no / total, 1.0))
-                status.write(f"Processing {frame_no:,}/{total:,} frames")
+                status.write(
+                    f"Processing {frame_no:,}/{total:,} frames"
+                )
 
         progress.progress(1.0)
-        cap.release()
-        cap = None
+
         if not rows:
-            raise RuntimeError("No people were detected. Try a clearer video.")
-        return (pd.DataFrame(rows), width, height, fps, duration, len(unique_ids), preview, clean, objects)
+            raise RuntimeError(
+                "No people were detected. Try a clearer video."
+            )
+
+        return (
+            pd.DataFrame(rows),
+            width,
+            height,
+            fps,
+            duration,
+            len(unique_ids),
+            preview,
+            clean,
+            objects,
+            str(output_path),
+        )
+
     finally:
         if cap is not None:
             cap.release()
+
+        if writer is not None:
+            writer.release()
+
         if video_path and Path(video_path).exists():
             Path(video_path).unlink(missing_ok=True)
 
 
+
 def auto_areas(tracks, width, height, objects=None):
-    """Find hotspots and name them from how people behave there."""
-    t = tracks[tracks["track_id"] >= 0].sort_values(["track_id", "timestamp"]).copy()
+    """Generate candidate retail zones from customer movement hotspots.
+
+    Returns the existing {"name": ..., "bounds": ...} format.
+    These are image-space activity regions, not calibrated floor boundaries.
+    """
+    required = {"track_id", "timestamp", "x_px", "y_px"}
+    if tracks.empty or not required.issubset(tracks.columns):
+        return [
+            {"name": f"{o['name']} {i}", "bounds": o["bounds"]}
+            for i, o in enumerate(objects or [], 1)
+        ]
+
+    t = tracks.loc[tracks["track_id"] >= 0].copy()
+    t = t.dropna(subset=["track_id", "timestamp", "x_px", "y_px"])
+    t = t.sort_values(["track_id", "timestamp"])
+
     if t.empty:
-        return [{"name": f"{o['name']} {k}", "bounds": o["bounds"]} for k, o in enumerate(objects or [], 1)]
+        return [
+            {"name": f"{o['name']} {i}", "bounds": o["bounds"]}
+            for i, o in enumerate(objects or [], 1)
+        ]
 
-    g = t.groupby("track_id")
-    dt = g["timestamp"].diff()
-    t["speed"] = np.hypot(g["x_px"].diff(), g["y_px"].diff()) / dt
+    # Estimate per-track movement in normalized image coordinates.
+    grouped = t.groupby("track_id", sort=False)
+    dt = grouped["timestamp"].diff().to_numpy(dtype=float)
+    dx = grouped["x_px"].diff().to_numpy(dtype=float)
+    dy = grouped["y_px"].diff().to_numpy(dtype=float)
 
-    density, xe, ye = make_density(t["x_px"].to_numpy(), t["y_px"].to_numpy(), width, height)
-    labels, n = nd_label(density >= density.max() * 0.30)
-    ends = pd.concat([g.head(1), g.tail(1)])
-    zones, counts = [], {}
+    valid_dt = np.isfinite(dt) & (dt > 0)
+    speed = np.full(len(t), np.nan, dtype=float)
+    speed[valid_dt] = (
+        np.hypot(dx[valid_dt], dy[valid_dt])
+        / dt[valid_dt]
+        / max(float(width), float(height), 1.0)
+    )
+    t["speed_norm"] = speed
 
-    for i in range(1, n + 1):
-        xs, ys = np.where(labels == i)
-        if len(xs) < 15:
-            continue
-        x1, x2 = xe[xs.min()], xe[xs.max() + 1]
-        y1, y2 = ye[ys.min()], ye[ys.max() + 1]
+    # Smooth the spatial histogram to suppress isolated noisy detections.
+    density, xe, ye = make_density(
+        t["x_px"].to_numpy(),
+        t["y_px"].to_numpy(),
+        width,
+        height,
+        bins=120,
+    )
 
-        def inside(d, x1=x1, x2=x2, y1=y1, y2=y2):
-            return d["x_px"].between(x1, x2) & d["y_px"].between(y1, y2)
+    peak = float(density.max())
+    if not np.isfinite(peak) or peak <= 0:
+        zones = []
+    else:
+        # Try a relative threshold, with a small absolute floor relative
+        # to the map's peak. Avoid treating the entire weak background as a zone.
+        thresholds = [0.35, 0.25, 0.18]
+        labels = np.zeros_like(density, dtype=int)
+        n = 0
 
-        sub = t[inside(t)]
-        if sub["track_id"].nunique() < 2:
-            continue
-        speed = sub["speed"].median() / width
-        dwell = sub.groupby("track_id")["timestamp"].agg(lambda s: s.max() - s.min()).median()
-        w, h = x2 - x1, y2 - y1
-        elong = max(w / h, h / w)
-        end_frac = inside(ends).sum() / max(1, len(ends))
-        near_edge = (x1 < 0.08 * width or x2 > 0.92 * width or y1 < 0.08 * height or y2 > 0.92 * height)
+        for fraction in thresholds:
+            candidate, count = nd_label(density >= peak * fraction)
+            min_cells = max(12, int(density.size * 0.0008))
+            keep = [
+                label_id
+                for label_id in range(1, count + 1)
+                if np.count_nonzero(candidate == label_id) >= min_cells
+            ]
 
-        if near_edge and end_frac > 0.25:
-            kind = "Entrance / Exit"
-        elif speed < 0.03 and dwell > 5:
-            kind = "Counter / Queue"
-        elif elong > 1.8 and speed >= 0.03:
-            kind = "Aisle"
-        else:
-            kind = "Shelf / Browsing area"
-        counts[kind] = counts.get(kind, 0) + 1
-        zones.append({"name": f"{kind} {counts[kind]}",
-                      "bounds": (max(0, x1), max(0, y1), min(width, x2), min(height, y2))})
+            # Prefer a few substantial regions over many tiny fragments.
+            if keep:
+                labels = np.zeros_like(candidate)
+                for new_id, old_id in enumerate(keep, start=1):
+                    labels[candidate == old_id] = new_id
+                n = len(keep)
+                break
 
-    for k, obj in enumerate(objects or [], 1):
-        zones.append({"name": f"{obj['name']} {k}", "bounds": obj["bounds"]})
+        zones, counts = [], {}
+
+        # Include first/last observed positions as weak evidence of entry/exit.
+        ends = pd.concat([
+            t.groupby("track_id", sort=False).head(1),
+            t.groupby("track_id", sort=False).tail(1),
+        ]).drop_duplicates()
+
+        for region_id in range(1, n + 1):
+            cells_x, cells_y = np.where(labels == region_id)
+            if len(cells_x) == 0:
+                continue
+
+            x1 = float(xe[cells_x.min()])
+            x2 = float(xe[cells_x.max() + 1])
+            y1 = float(ye[cells_y.min()])
+            y2 = float(ye[cells_y.max() + 1])
+
+            # Skip implausibly tiny or nearly full-frame regions.
+            box_w = x2 - x1
+            box_h = y2 - y1
+            box_area = (box_w * box_h) / max(float(width * height), 1.0)
+
+            if box_w < 0.04 * width or box_h < 0.04 * height:
+                continue
+            if box_area > 0.70:
+                continue
+
+            inside = (
+                t["x_px"].between(x1, x2)
+                & t["y_px"].between(y1, y2)
+            )
+            sub = t.loc[inside]
+
+            visitor_count = int(sub["track_id"].nunique())
+            if visitor_count < 2:
+                continue
+
+            per_track = sub.groupby("track_id").agg(
+                first_time=("timestamp", "min"),
+                last_time=("timestamp", "max"),
+                median_speed=("speed_norm", "median"),
+                observations=("timestamp", "size"),
+            )
+            per_track["span_s"] = (
+                per_track["last_time"] - per_track["first_time"]
+            )
+
+            median_dwell = float(per_track["span_s"].median())
+            median_speed = float(per_track["median_speed"].median())
+            stationary_share = float(
+                (per_track["median_speed"].fillna(0) < 0.0005).mean()
+            )
+
+            edge_margin_x = 0.08 * width
+            edge_margin_y = 0.08 * height
+            near_edge = (
+                x1 < edge_margin_x
+                or x2 > width - edge_margin_x
+                or y1 < edge_margin_y
+                or y2 > height - edge_margin_y
+            )
+
+            end_inside = (
+                ends["x_px"].between(x1, x2)
+                & ends["y_px"].between(y1, y2)
+            )
+            end_fraction = float(end_inside.mean()) if len(ends) else 0.0
+
+            aspect = max(
+                box_w / max(box_h, 1.0),
+                box_h / max(box_w, 1.0),
+            )
+
+            if near_edge and end_fraction >= 0.25:
+                kind = "Entrance / Exit candidate"
+            elif stationary_share >= 0.5 and median_dwell >= 5:
+                kind = "Browsing / Queue candidate"
+            elif aspect >= 1.8 and median_speed >= 0.0005:
+                kind = "Transit / Aisle candidate"
+            else:
+                kind = "Customer activity zone"
+
+            counts[kind] = counts.get(kind, 0) + 1
+            zones.append({
+                "name": f"{kind} {counts[kind]}",
+                "bounds": (
+                    max(0.0, x1),
+                    max(0.0, y1),
+                    min(float(width), x2),
+                    min(float(height), y2),
+                ),
+            })
+
+    # Preserve detected objects as contextual candidates.
+    for i, obj in enumerate(objects or [], 1):
+        zones.append({
+            "name": f"{obj['name']} {i}",
+            "bounds": tuple(map(float, obj["bounds"])),
+        })
+
     return zones
+
+
+
+
+
+
+
+
+
+# def auto_areas(tracks, width, height, objects=None):
+#     """Find hotspots and name them from how people behave there."""
+#     t = tracks[tracks["track_id"] >= 0].sort_values(["track_id", "timestamp"]).copy()
+#     if t.empty:
+#         return [{"name": f"{o['name']} {k}", "bounds": o["bounds"]} for k, o in enumerate(objects or [], 1)]
+
+#     g = t.groupby("track_id")
+#     dt = g["timestamp"].diff()
+#     t["speed"] = np.hypot(g["x_px"].diff(), g["y_px"].diff()) / dt
+
+#     density, xe, ye = make_density(t["x_px"].to_numpy(), t["y_px"].to_numpy(), width, height)
+#     labels, n = nd_label(density >= density.max() * 0.30)
+#     ends = pd.concat([g.head(1), g.tail(1)])
+#     zones, counts = [], {}
+
+#     for i in range(1, n + 1):
+#         xs, ys = np.where(labels == i)
+#         if len(xs) < 15:
+#             continue
+#         x1, x2 = xe[xs.min()], xe[xs.max() + 1]
+#         y1, y2 = ye[ys.min()], ye[ys.max() + 1]
+
+#         def inside(d, x1=x1, x2=x2, y1=y1, y2=y2):
+#             return d["x_px"].between(x1, x2) & d["y_px"].between(y1, y2)
+
+#         sub = t[inside(t)]
+#         if sub["track_id"].nunique() < 2:
+#             continue
+#         speed = sub["speed"].median() / width
+#         dwell = sub.groupby("track_id")["timestamp"].agg(lambda s: s.max() - s.min()).median()
+#         w, h = x2 - x1, y2 - y1
+#         elong = max(w / h, h / w)
+#         end_frac = inside(ends).sum() / max(1, len(ends))
+#         near_edge = (x1 < 0.08 * width or x2 > 0.92 * width or y1 < 0.08 * height or y2 > 0.92 * height)
+
+#         if near_edge and end_frac > 0.25:
+#             kind = "Entrance / Exit"
+#         elif speed < 0.03 and dwell > 5:
+#             kind = "Counter / Queue"
+#         elif elong > 1.8 and speed >= 0.03:
+#             kind = "Aisle"
+#         else:
+#             kind = "Shelf / Browsing area"
+#         counts[kind] = counts.get(kind, 0) + 1
+#         zones.append({"name": f"{kind} {counts[kind]}",
+#                       "bounds": (max(0, x1), max(0, y1), min(width, x2), min(height, y2))})
+
+#     for k, obj in enumerate(objects or [], 1):
+#         zones.append({"name": f"{obj['name']} {k}", "bounds": obj["bounds"]})
+#     return zones
+
+
+
+
+
+
+
 
 # =========================================================
 # SYNTHETIC DATA (clearly fake; demo only)
@@ -304,29 +730,130 @@ def simulate_store(seed=42, n=140):
 # =========================================================
 # ANALYTICS
 # =========================================================
+
+#original
+# def prepare(tracks, areas, width):
+#     t = tracks[tracks["track_id"] >= 0].sort_values(["track_id", "timestamp"]).copy()
+#     if t.empty:
+#         return t, 1.0
+#     g = t.groupby("track_id")
+#     for c in ("x_px", "y_px"):
+#         t[c + "_s"] = g[c].transform(lambda s: s.rolling(3, center=True, min_periods=1).median())
+#     g = t.groupby("track_id")
+#     dt = g["timestamp"].diff()
+#     dist = np.hypot(g["x_px_s"].diff(), g["y_px_s"].diff())
+#     t["speed"] = (dist / dt / width).where(dt > 0)
+#     t["speed"] = t.groupby("track_id")["speed"].transform(lambda s: s.rolling(3, center=True, min_periods=1).median())
+#     interval = float(np.nanmedian(dt)) if dt.notna().any() else 1.0
+#     interval = interval if interval > 0 else 1.0
+#     nxt = t.groupby("track_id")["timestamp"].shift(-1) - t["timestamp"]
+#     t["dur"] = nxt.clip(upper=interval * 2.5).fillna(0.0)
+
+#     t["area"] = OTHER
+#     size = lambda a: (a["bounds"][2] - a["bounds"][0]) * (a["bounds"][3] - a["bounds"][1])
+#     for a in sorted(areas, key=size, reverse=True):  # smaller areas win overlaps
+#         x1, y1, x2, y2 = a["bounds"]
+#         m = t["x_px_s"].between(x1, x2) & t["y_px_s"].between(y1, y2)
+#         t.loc[m, "area"] = a["name"]
+#     return t, interval
+
+#verison1
+
+
 def prepare(tracks, areas, width):
-    t = tracks[tracks["track_id"] >= 0].sort_values(["track_id", "timestamp"]).copy()
+    t = tracks[tracks["track_id"] >= 0].sort_values(
+        ["track_id", "timestamp"]
+    ).copy()
+
     if t.empty:
         return t, 1.0
+
     g = t.groupby("track_id")
+
     for c in ("x_px", "y_px"):
-        t[c + "_s"] = g[c].transform(lambda s: s.rolling(3, center=True, min_periods=1).median())
+        t[c + "_s"] = g[c].transform(
+            lambda s: s.rolling(
+                3, center=True, min_periods=1
+            ).median()
+        )
+
     g = t.groupby("track_id")
     dt = g["timestamp"].diff()
-    dist = np.hypot(g["x_px_s"].diff(), g["y_px_s"].diff())
+    dist = np.hypot(
+        g["x_px_s"].diff(),
+        g["y_px_s"].diff()
+    )
+
     t["speed"] = (dist / dt / width).where(dt > 0)
-    t["speed"] = t.groupby("track_id")["speed"].transform(lambda s: s.rolling(3, center=True, min_periods=1).median())
+
+    t["speed"] = t.groupby("track_id")["speed"].transform(
+        lambda s: s.rolling(
+            3, center=True, min_periods=1
+        ).median()
+    )
+
     interval = float(np.nanmedian(dt)) if dt.notna().any() else 1.0
     interval = interval if interval > 0 else 1.0
-    nxt = t.groupby("track_id")["timestamp"].shift(-1) - t["timestamp"]
+
+    nxt = (
+        t.groupby("track_id")["timestamp"].shift(-1)
+        - t["timestamp"]
+    )
     t["dur"] = nxt.clip(upper=interval * 2.5).fillna(0.0)
 
+    # Default assignment for points outside every zone.
     t["area"] = OTHER
-    size = lambda a: (a["bounds"][2] - a["bounds"][0]) * (a["bounds"][3] - a["bounds"][1])
-    for a in sorted(areas, key=size, reverse=True):  # smaller areas win overlaps
-        x1, y1, x2, y2 = a["bounds"]
-        m = t["x_px_s"].between(x1, x2) & t["y_px_s"].between(y1, y2)
-        t.loc[m, "area"] = a["name"]
+
+    def zone_size(a):
+        if "polygon" in a:
+            points = np.asarray(a["polygon"], dtype=np.float32)
+            if points.ndim != 2 or points.shape[0] < 3:
+                return 0.0
+            return abs(cv2.contourArea(points))
+
+        if "bounds" in a:
+            x1, y1, x2, y2 = a["bounds"]
+            return max(0, x2 - x1) * max(0, y2 - y1)
+
+        return 0.0
+
+    # Assign larger zones first; smaller zones overwrite them,
+    # so the smallest zone wins when zones overlap.
+    for a in sorted(areas, key=zone_size, reverse=True):
+        name = a["name"]
+
+        if "polygon" in a:
+            points = np.asarray(
+                a["polygon"], dtype=np.float32
+            ).reshape((-1, 2))
+
+            if len(points) < 3:
+                continue
+
+            inside = np.array([
+                cv2.pointPolygonTest(
+                    points,
+                    (float(x), float(y)),
+                    False
+                ) >= 0
+                for x, y in zip(t["x_px_s"], t["y_px_s"])
+            ])
+
+            mask = pd.Series(inside, index=t.index)
+
+        elif "bounds" in a:
+            x1, y1, x2, y2 = a["bounds"]
+
+            mask = (
+                t["x_px_s"].between(x1, x2)
+                & t["y_px_s"].between(y1, y2)
+            )
+
+        else:
+            continue
+
+        t.loc[mask, "area"] = name
+
     return t, interval
 
 
@@ -679,12 +1206,59 @@ def render(tracks, meta, areas, synthetic, background=None):
                        "before changing the store layout.")
 
 # =========================================================
+def extract_preview(video_bytes, filename):
+    """Extract a clean representative frame before running detection."""
+    suffix = Path(filename).suffix or ".mp4"
+    video_path = None
+    cap = None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
+            temp.write(video_bytes)
+            video_path = temp.name
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError("Could not open the uploaded video.")
+
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            raise RuntimeError("The uploaded video contains no readable frames.")
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, total // 2)
+        ok, frame = cap.read()
+
+        if not ok:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = cap.read()
+
+        if not ok:
+            raise RuntimeError("Could not extract a preview frame.")
+
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), width, height
+
+    finally:
+        if cap is not None:
+            cap.release()
+        if video_path is not None:
+            Path(video_path).unlink(missing_ok=True)
+
+
+# =========================================================
 # PAGES
 # =========================================================
 if synthetic_mode:
     tracks = simulate_store()
-    meta = {"width": SYN_W, "height": SYN_H, "duration": float(tracks["timestamp"].max()),
-            "fps": 1.0, "ids": int(tracks["track_id"].nunique())}
+    meta = {
+        "width": SYN_W,
+        "height": SYN_H,
+        "duration": float(tracks["timestamp"].max()),
+        "fps": 1.0,
+        "ids": int(tracks["track_id"].nunique()),
+    }
     render(tracks, meta, SYN_AREAS, synthetic=True)
 
 else:
@@ -692,81 +1266,537 @@ else:
         st.info("Upload a store video in the sidebar.")
         st.stop()
 
-    with st.expander("Preview uploaded video", expanded=False):
-        st.video(uploaded_video)
+    from streamlit_drawable_canvas import st_canvas
 
-    if st.button("Run Analysis", type="primary"):
+    video_bytes = uploaded_video.getvalue()
+    video_hash = hashlib.md5(video_bytes).hexdigest()
+    video_key = (uploaded_video.name, video_hash)
+    widget_suffix = video_hash[:10]
+
+    # Reset zones and results whenever the selected video changes.
+    if st.session_state.get("sf_upload_key") != video_key:
+        for key in (
+            "sf_tracks",
+            "sf_meta",
+            "sf_preview",
+            "sf_clean",
+            "sf_areas",
+            "sf_validation",
+            "sf_results_video_key",
+        ):
+            st.session_state.pop(key, None)
+
+        st.session_state["sf_upload_key"] = video_key
+
+    with st.expander("Preview uploaded video", expanded=False):
+        st.video(video_bytes)
+
+    # Extract a clean frame before running detection.
+    if st.session_state.get("sf_preview_video_key") != video_key:
         try:
-            with st.spinner("Detecting and tracking people..."):
-                result = process_video(uploaded_video.getvalue(), uploaded_video.name)
-            (tracks, width, height, fps, duration, ids, preview, clean, objects) = result
-            st.session_state["sf_tracks"] = tracks
-            st.session_state["sf_meta"] = {"width": width, "height": height, "fps": fps,
-                                           "duration": duration, "ids": ids}
-            st.session_state["sf_preview"] = preview
+            with st.spinner("Preparing a frame for zone selection..."):
+                clean, preview_width, preview_height = extract_preview(
+                    video_bytes, uploaded_video.name
+                )
+
             st.session_state["sf_clean"] = clean
-            st.session_state["sf_areas"] = auto_areas(tracks, width, height, objects)
-            st.session_state["sf_video_key"] = (uploaded_video.name, len(uploaded_video.getvalue()))
-            st.session_state.pop("sf_validation", None)
+            st.session_state["sf_preview_size"] = (
+                preview_width, preview_height
+            )
+            st.session_state["sf_preview_video_key"] = video_key
+
         except Exception as exc:
-            st.error(f"Analysis failed: {exc}")
+            st.error(f"Could not prepare video preview: {exc}")
             st.stop()
 
-    if "sf_tracks" not in st.session_state:
-        st.info("Click Run Analysis to process the uploaded video.")
-        st.stop()
+    width, height = st.session_state["sf_preview_size"]
+    clean = st.session_state["sf_clean"]
 
-    if st.session_state.get("sf_video_key") != (uploaded_video.name, len(uploaded_video.getvalue())):
-        st.warning("A different video is selected. Click Run Analysis to replace the previous results.")
-        st.stop()
+    st.subheader("Step 1 — Draw your store zones")
+    st.caption(
+        "Draw one rectangle per zone on the frame. Then enter one name "
+        "per rectangle, in the same order you drew them. "
+        "You can rename saved zones before running the analysis."
+    )
 
-    tracks = st.session_state["sf_tracks"]
-    meta = st.session_state["sf_meta"]
-    preview = st.session_state["sf_preview"]
+    canvas_height = min(650, max(200, round(800 * height / width)))
+    canvas_width = max(1, round(canvas_height * width / height))
+    background = Image.fromarray(clean).resize(
+        (canvas_width, canvas_height)
+    )
 
-    with st.expander("Configure store areas", expanded=not st.session_state.get("sf_areas")):
-        st.caption("Areas are inferred from movement (fridges are detected directly). Counters are inferred, "
-                   "not visually recognised. Draw rectangles over the frame to define your own.")
-        if preview is not None:
-            from streamlit_drawable_canvas import st_canvas
+    canvas = st_canvas(
+        fill_color="rgba(245, 185, 65, 0.20)",
+        stroke_width=2,
+        stroke_color="#a65a16",
+        background_image=background,
+        update_streamlit=True,
+        height=canvas_height,
+        width=canvas_width,
+        drawing_mode="rect",
+        key=f"sf_area_canvas_{widget_suffix}",
+    )
+    #st.write("Canvas data:", canvas.json_data)
 
-            canvas_height = min(650, max(200, round(800 * meta["height"] / meta["width"])))
-            canvas_width = round(canvas_height * meta["width"] / meta["height"])
-            bg = Image.fromarray(preview).resize((canvas_width, canvas_height))
-            names_text = st.text_area("Area names for drawn rectangles (one per line, in drawing order)",
-                                      value="Entrance\nAisle 1\nAisle 2\nCheckout Counter\nProduce\nDairy",
-                                      key="sf_area_names")
-            names = [ln.strip() for ln in names_text.splitlines() if ln.strip()]
-            canvas = st_canvas(fill_color="rgba(245, 185, 65, 0.15)", stroke_width=2, stroke_color="#a65a16",
-                               background_image=bg, update_streamlit=True, height=canvas_height,
-                               width=canvas_width, drawing_mode="rect", key="sf_area_canvas")
-            if st.button("Save drawn areas"):
-                objs = canvas.json_data.get("objects", []) if canvas.json_data else []
-                sx, sy = meta["width"] / canvas_width, meta["height"] / canvas_height
-                saved = []
-                for i, o in enumerate([o for o in objs if o.get("type") == "rect"]):
-                    if i >= len(names):
-                        break
-                    left, top = float(o.get("left", 0)), float(o.get("top", 0))
-                    w = float(o.get("width", 0)) * float(o.get("scaleX", 1))
-                    h = float(o.get("height", 0)) * float(o.get("scaleY", 1))
-                    saved.append({"name": names[i], "bounds": (
-                        max(0, left * sx), max(0, top * sy),
-                        min(meta["width"], (left + w) * sx), min(meta["height"], (top + h) * sy))})
-                st.session_state["sf_areas"] = saved
-                if saved:
-                    st.success(f"Saved {len(saved)} areas.")
+    
+    canvas_objects = (
+        canvas.json_data.get("objects", [])
+        if canvas.json_data else []
+    )
+    #st.write("DEBUG — Canvas objects:", canvas_objects)
+
+    polygons = [
+        obj for obj in canvas_objects
+        if obj.get("type", "").lower() in ("rect", "polygon")
+        and (
+            obj.get("type", "").lower() == "rect"
+            or len(obj.get("points", [])) >= 3
+        )
+    ]
+
+    st.subheader("Name your zones")
+    names = []
+
+    for i in range(len(polygons)):
+        name = st.text_input(
+            f"Zone {i + 1} name",
+            key=f"sf_area_name_{widget_suffix}_{i}",
+            placeholder=f"e.g. Browsing Area {i + 1}",
+        )
+        if name.strip():
+            names.append(name.strip())
+        else:
+            names.append("")
+
+    #names = [line.strip() for line in names_text.splitlines() if line.strip()]
+    ##origina
+    # if st.button("Save drawn zones", key=f"sf_save_areas_{widget_suffix}"):
+    #     objects = (
+    #         canvas.json_data.get("objects", [])
+    #         if canvas.json_data else []
+    #     )
+    #     rectangles = [obj for obj in objects if obj.get("type") == "rect"]
+
+    #     if not rectangles:
+    #         st.warning("Draw at least one rectangle on the preview first.")
+    #     elif len(names) != len(rectangles):
+    #         st.warning(
+    #             f"You drew {len(rectangles)} rectangles but entered "
+    #             f"{len(names)} names. Enter exactly one name per rectangle."
+    #         )
+    #     else:
+    #         scale_x = width / canvas_width
+    #         scale_y = height / canvas_height
+    #         saved = []
+
+    #         for name, obj in zip(names, rectangles):
+    #             left = float(obj.get("left", 0))
+    #             top = float(obj.get("top", 0))
+    #             rect_width = float(obj.get("width", 0)) * float(
+    #                 obj.get("scaleX", 1)
+    #             )
+    #             rect_height = float(obj.get("height", 0)) * float(
+    #                 obj.get("scaleY", 1)
+    #             )
+
+    #             x1 = max(0.0, min(float(width), left * scale_x))
+    #             y1 = max(0.0, min(float(height), top * scale_y))
+    #             x2 = max(
+    #                 0.0, min(float(width), (left + rect_width) * scale_x)
+    #             )
+    #             y2 = max(
+    #                 0.0, min(float(height), (top + rect_height) * scale_y)
+    #             )
+
+    #             if x2 <= x1 or y2 <= y1:
+    #                 continue
+
+    #             saved.append({
+    #                 "name": name,
+    #                 "bounds": (x1, y1, x2, y2),
+    #             })
+
+    #         if saved:
+    #             st.session_state["sf_areas"] = saved
+    #             st.success(f"Saved {len(saved)} zones.")
+    #         else:
+    #             st.warning("The rectangles were empty or invalid. Draw them again.")
+
+    ##veeison1
+
+    # if st.button("Save drawn zones", key=f"sf_save_areas_{widget_suffix}"):
+    #     objects = (
+    #         canvas.json_data.get("objects", [])
+    #         if canvas.json_data else []
+    #     )
+
+    #     polygons = [
+    #         obj for obj in objects
+    #         if obj.get("type", "").lower() == "polygon"
+    #         and len(obj.get("points", [])) >= 3
+    #     ]
+
+    #     if not polygons:
+    #         st.warning(
+    #             "No valid polygons found. Draw a rectangle and reshape "
+    #             "its vertices before saving."
+    #         )
+    #     elif any(not name for name in names):
+    #         st.warning("Please enter a name for every polygon.")
+    #         st.warning(
+    #             f"You drew {len(polygons)} polygons but entered "
+    #             f"{len(names)} names. Enter exactly one name per polygon."
+    #         )
+    #     else:
+    #         scale_x = width / canvas_width
+    #         scale_y = height / canvas_height
+    #         saved = []
+
+    #         for name, obj in zip(names, polygons):
+    #             points = obj["points"]
+
+    #             # Fabric polygon points are relative to the object's
+    #             # center. Convert them to canvas coordinates.
+    #             left = float(obj.get("left", 0))
+    #             top = float(obj.get("top", 0))
+    #             origin_x = obj.get("originX", "center")
+    #             origin_y = obj.get("originY", "center")
+
+    #             if origin_x == "center":
+    #                 center_x = left
+    #             elif origin_x == "right":
+    #                 center_x = left - float(obj.get("width", 0)) / 2
+    #             else:
+    #                 center_x = left + float(obj.get("width", 0)) / 2
+
+    #             if origin_y == "center":
+    #                 center_y = top
+    #             elif origin_y == "bottom":
+    #                 center_y = top - float(obj.get("height", 0)) / 2
+    #             else:
+    #                 center_y = top + float(obj.get("height", 0)) / 2
+
+    #             polygon_points = []
+
+    #             for point in points:
+    #                 px = (
+    #                     center_x
+    #                     + float(point["x"]) * float(obj.get("scaleX", 1))
+    #                 )
+    #                 py = (
+    #                     center_y
+    #                     + float(point["y"]) * float(obj.get("scaleY", 1))
+    #                 )
+
+    #                 px = max(0.0, min(float(canvas_width), px))
+    #                 py = max(0.0, min(float(canvas_height), py))
+
+    #                 polygon_points.append((
+    #                     px * scale_x,
+    #                     py * scale_y,
+    #                 ))
+
+    #             if len(set(polygon_points)) < 3:
+    #                 continue
+
+    #             saved.append({
+    #                 "name": name,
+    #                 "polygon": polygon_points,
+    #             })
+
+    #         if saved:
+    #             st.session_state["sf_areas"] = saved
+    #             st.success(f"Saved {len(saved)} polygon zones.")
+    #         else:
+    #             st.warning("The polygons were invalid. Please reshape them.")
+
+    ##version2
+
+    
+    # if st.button("Save drawn zones", key=f"sf_save_areas_{widget_suffix}"):
+    #     objects = (
+    #         canvas.json_data.get("objects", [])
+    #         if canvas.json_data else []
+    #     )
+
+    #     shapes = [
+    #         obj for obj in objects
+    #         if obj.get("type", "").lower() in ("rect", "polygon")
+    #     ]
+
+    #     if not shapes:
+    #         st.warning("Draw at least one rectangle or polygon first.")
+    #     elif len(names) != len(shapes) or any(not name for name in names):
+    #         st.warning(
+    #             f"You drew {len(shapes)} shapes. "
+    #             "Enter exactly one name for every shape."
+    #         )
+    #     else:
+    #         scale_x = width / canvas_width
+    #         scale_y = height / canvas_height
+    #         saved = []
+
+    #         for name, obj in zip(names, shapes):
+    #             shape_type = obj.get("type", "").lower()
+
+    #             if shape_type == "rect":
+    #                 left = float(obj.get("left", 0))
+    #                 top = float(obj.get("top", 0))
+    #                 rect_width = float(obj.get("width", 0)) * float(
+    #                     obj.get("scaleX", 1)
+    #                 )
+    #                 rect_height = float(obj.get("height", 0)) * float(
+    #                     obj.get("scaleY", 1)
+    #                 )
+
+    #                 x1 = max(0.0, min(float(canvas_width), left))
+    #                 y1 = max(0.0, min(float(canvas_height), top))
+    #                 x2 = max(
+    #                     0.0,
+    #                     min(float(canvas_width), left + rect_width)
+    #                 )
+    #                 y2 = max(
+    #                     0.0,
+    #                     min(float(canvas_height), top + rect_height)
+    #                 )
+
+    #                 if x2 <= x1 or y2 <= y1:
+    #                     continue
+
+    #                 saved.append({
+    #                     "name": name,
+    #                     "polygon": [
+    #                         (x1 * scale_x, y1 * scale_y),
+    #                         (x2 * scale_x, y1 * scale_y),
+    #                         (x2 * scale_x, y2 * scale_y),
+    #                         (x1 * scale_x, y2 * scale_y),
+    #                     ],
+    #                 })
+
+    #             elif shape_type == "polygon":
+    #                 points = obj.get("points", [])
+    #                 if len(points) < 3:
+    #                     continue
+
+    #                 left = float(obj.get("left", 0))
+    #                 top = float(obj.get("top", 0))
+    #                 origin_x = obj.get("originX", "center")
+    #                 origin_y = obj.get("originY", "center")
+
+    #                 center_x = (
+    #                     left if origin_x == "center"
+    #                     else left - float(obj.get("width", 0)) / 2
+    #                     if origin_x == "right"
+    #                     else left + float(obj.get("width", 0)) / 2
+    #                 )
+    #                 center_y = (
+    #                     top if origin_y == "center"
+    #                     else top - float(obj.get("height", 0)) / 2
+    #                     if origin_y == "bottom"
+    #                     else top + float(obj.get("height", 0)) / 2
+    #                 )
+
+    #                 polygon_points = []
+    #                 for point in points:
+    #                     px = center_x + float(point["x"]) * float(
+    #                         obj.get("scaleX", 1)
+    #                     )
+    #                     py = center_y + float(point["y"]) * float(
+    #                         obj.get("scaleY", 1)
+    #                     )
+
+    #                     px = max(0.0, min(float(canvas_width), px))
+    #                     py = max(0.0, min(float(canvas_height), py))
+    #                     polygon_points.append((px * scale_x, py * scale_y))
+
+    #                 if len(set(polygon_points)) < 3:
+    #                     continue
+
+    #                 saved.append({
+    #                     "name": name,
+    #                     "polygon": polygon_points,
+    #                 })
+
+    #         if saved:
+    #             st.session_state["sf_areas"] = saved
+    #             st.success(f"Saved {len(saved)} zones.")
+    #         else:
+    #             st.warning("The drawn shapes were invalid. Please draw them again.")
+
+    ##verison3
+
+    if st.button("Save drawn zones", key=f"sf_save_areas_{widget_suffix}"):
+        objects = (
+            canvas.json_data.get("objects", [])
+            if canvas.json_data else []
+        )
+
+        shapes = [
+            obj for obj in objects
+            if obj.get("type", "").lower() in ("rect", "polygon")
+        ]
+
+        if not shapes:
+            st.warning("Draw at least one rectangle or polygon first.")
+        elif len(names) != len(shapes) or any(not name for name in names):
+            st.warning("Enter a name for every drawn shape.")
+        else:
+            scale_x = width / canvas_width
+            scale_y = height / canvas_height
+            saved = []
+
+            for name, obj in zip(names, shapes):
+                shape_type = obj.get("type", "").lower()
+
+                if shape_type == "rect":
+                    # Fabric Rect: left/top are its top-left corner.
+                    x1 = float(obj.get("left", 0))
+                    y1 = float(obj.get("top", 0))
+                    x2 = x1 + float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
+                    y2 = y1 + float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
+
+                    points = [
+                        (x1, y1),
+                        (x2, y1),
+                        (x2, y2),
+                        (x1, y2),
+                    ]
+
                 else:
-                    st.warning("Draw at least one rectangle first.")
+                    # Fabric Polygon points are relative to its center.
+                    left = float(obj.get("left", 0))
+                    top = float(obj.get("top", 0))
+                    origin_x = obj.get("originX", "center")
+                    origin_y = obj.get("originY", "center")
 
-        cur = st.session_state.get("sf_areas", [])
-        if cur:
-            edited = st.data_editor(pd.DataFrame({"Area": [a["name"] for a in cur]}),
-                                    hide_index=True, key=f"sf_rename_{len(cur)}")
-            st.session_state["sf_areas"] = [{**a, "name": n} for a, n in zip(cur, edited["Area"])]
+                    center_x = (
+                        left if origin_x == "center"
+                        else left - float(obj.get("width", 0)) / 2
+                        if origin_x == "right"
+                        else left + float(obj.get("width", 0)) / 2
+                    )
+                    center_y = (
+                        top if origin_y == "center"
+                        else top - float(obj.get("height", 0)) / 2
+                        if origin_y == "bottom"
+                        else top + float(obj.get("height", 0)) / 2
+                    )
+
+                    points = [
+                        (
+                            center_x + float(p["x"]) * float(obj.get("scaleX", 1)),
+                            center_y + float(p["y"]) * float(obj.get("scaleY", 1)),
+                        )
+                        for p in obj.get("points", [])
+                    ]
+
+                points = [
+                    (
+                        max(0.0, min(float(canvas_width), x)) * scale_x,
+                        max(0.0, min(float(canvas_height), y)) * scale_y,
+                    )
+                    for x, y in points
+                ]
+
+                if len(set(points)) < 3:
+                    continue
+
+                saved.append({
+                    "name": name,
+                    "polygon": points,
+                })
+
+            if saved:
+                st.session_state["sf_areas"] = saved
+                st.success(f"Saved {len(saved)} zones.")
+            else:
+                st.warning("The drawn shapes were invalid. Please draw them again.")
+
+
+
 
     areas = st.session_state.get("sf_areas", [])
-    if not areas:
-        st.info("No areas found yet. Draw and save areas above to see analytics.")
-        st.stop()
-    render(tracks, meta, areas, synthetic=False, background=st.session_state.get("sf_clean"))
+
+    if areas:
+        st.subheader("Step 2 — Review your zones")
+
+        edited = st.data_editor(
+            pd.DataFrame({"Area": [area["name"] for area in areas]}),
+            hide_index=True,
+            key=f"sf_rename_{widget_suffix}_{len(areas)}",
+        )
+
+        renamed = []
+        for area, name in zip(areas, edited["Area"]):
+            clean_name = str(name).strip() or area["name"]
+            renamed.append({**area, "name": clean_name})
+
+        st.session_state["sf_areas"] = renamed
+        areas = renamed
+
+        st.caption(f"{len(areas)} zones ready for analysis.")
+    else:
+        st.info("Draw and save at least one zone before running analysis.")
+
+    st.subheader("Step 3 — Run the analysis")
+
+    if st.button(
+        "Run Analysis",
+        type="primary",
+        disabled=not areas,
+        key=f"sf_run_analysis_{widget_suffix}",
+    ):
+        try:
+            with st.spinner("Detecting and tracking people..."):
+                result = process_video(video_bytes, uploaded_video.name)
+
+            (
+                tracks, result_width, result_height, fps, duration,
+                ids, annotated_preview, analysis_clean, objects,processed_video_path
+            ) = result
+
+            st.session_state["sf_processed_video"] = processed_video_path
+            st.session_state["sf_tracks"] = tracks
+            st.session_state["sf_meta"] = {
+                "width": result_width,
+                "height": result_height,
+                "fps": fps,
+                "duration": duration,
+                "ids": ids,
+            }
+            st.session_state["sf_preview"] = annotated_preview
+            st.session_state["sf_results_video_key"] = video_key
+            st.session_state.pop("sf_validation", None)
+
+            st.success("Analysis completed.")
+
+        except Exception as exc:
+            st.error(f"Analysis failed: {exc}")
+
+    # Only show results belonging to the currently selected video.
+    if st.session_state.get("sf_results_video_key") == video_key:
+        render(
+            st.session_state["sf_tracks"],
+            st.session_state["sf_meta"],
+            st.session_state.get("sf_areas", []),
+            synthetic=False,
+            background=st.session_state.get("sf_clean"),
+        )
+
+
+
+processed_video_path = st.session_state.get("sf_processed_video")
+
+if processed_video_path and Path(processed_video_path).is_file():
+    st.subheader("Processed video")
+
+    video_bytes = Path(processed_video_path).read_bytes()
+
+    st.video(video_bytes, format="video/mp4")
+
+    st.download_button(
+        "Download processed video",
+        data=video_bytes,
+        file_name=Path(processed_video_path).name,
+        mime="video/mp4",
+    )
