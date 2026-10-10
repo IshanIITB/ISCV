@@ -26,7 +26,12 @@ motion:
 flags:
   density_threshold: 1.0
   speed_threshold_mps: 0.25
-  persistence_seconds: 180
+  persistence_seconds: 45
+  max_low_quality_fraction: 0.25
+  medium_density_threshold: 1.5
+  medium_speed_threshold_mps: 0.15
+  high_density_threshold: 2.0
+  high_speed_threshold_mps: 0.10
 zones:
   - name: entrance
     type: entrance

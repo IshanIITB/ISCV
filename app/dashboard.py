@@ -349,65 +349,9 @@ def build_runs(t, min_visit):
     return runs[(runs["n"] >= 2) & (runs["dur"] >= min_visit)]
 
 
-#origunl
-# def area_table(t, runs, areas, occ_thr, persist_s):
-#     valid = runs[runs["area"] != OTHER]
-#     total = max(1, valid["track_id"].nunique())
-#     rows = []
-#     for a in areas:
-#         name = a["name"]
-#         r = runs[runs["area"] == name]
-#         rt = t[t["area"] == name]
-#         visitors = r["track_id"].nunique()
-#         stoppers = r.loc[r["still"] >= MIN_STOP_S, "track_id"].nunique()
-#         if len(rt):
-#             occ = rt.groupby(rt["timestamp"] // BIN_S)["track_id"].nunique()
-#             peak, cong = int(occ.max()), int((occ >= occ_thr).sum()) * BIN_S
-#             med_speed = float(rt["speed"].median())
-#         else:
-#             peak, cong, med_speed = 0, 0, np.nan
-#         rows.append({
-#             "Area": name, "Visitors": visitors,
-#             "Share %": round(100 * visitors / total, 1),
-#             "Median visit s": round(float(r["dur"].median()), 1) if len(r) else np.nan,
-#             "Presence s": round(float(r["dur"].sum()), 1),
-#             "Stationary s": round(float(r["still"].sum()), 1),
-#             "Stop rate %": round(100 * stoppers / visitors, 1) if visitors else 0.0,
-#             "Peak occupancy": peak, "Congested s": cong,
-#             "Median speed": round(med_speed, 3) if np.isfinite(med_speed) else np.nan,
-#         })
-#     df = pd.DataFrame(rows)
-#     if df.empty:
-#         df["Status"] = []
-#         return df
-
-#     mean_share = df["Share %"].mean()
-#     med_visit = df["Median visit s"].median()
-#     enough = total >= 10 and len(df) >= 3
-#     statuses = []
-#     for _, r in df.iterrows():
-#         is_gate = any(k in r["Area"].lower() for k in ("entr", "exit"))
-#         if not enough:
-#             s = "Not enough data"
-#         elif r["Congested s"] >= persist_s and (pd.isna(r["Median speed"]) or r["Median speed"] < 0.06):
-#             s = "Congestion candidate"
-#         elif is_gate:
-#             s = "Normal"
-#         elif r["Share %"] < 0.35 * mean_share:
-#             s = "Dead-zone candidate"
-#         elif r["Stop rate %"] >= 60 and r["Median visit s"] > med_visit:
-#             s = "Hot / high engagement"
-#         elif r["Share %"] >= mean_share and r["Stop rate %"] < 25:
-#             s = "High traffic, few stops"
-#         else:
-#             s = "Normal"
-#         statuses.append(s)
-#     df["Status"] = statuses
-#     return df
-
-
 
 #version1
+
 
 
 def area_table(t, runs, areas, occ_thr, persist_s):
@@ -432,7 +376,10 @@ def area_table(t, runs, areas, occ_thr, persist_s):
 
             # Fill missing bins with zero occupancy so a gap breaks
             # a continuous congestion period.
-            full_index = range(int(occ.index.min()), int(occ.index.max()) + 1)
+            full_index = range(
+                int(occ.index.min()),
+                int(occ.index.max()) + 1
+            )
             occ = occ.reindex(full_index, fill_value=0)
 
             peak = int(occ.max())
@@ -459,17 +406,20 @@ def area_table(t, runs, areas, occ_thr, persist_s):
             "Visitors": visitors,
             "Share %": round(100 * visitors / total, 1),
             "Median visit s": (
-                round(float(r["dur"].median()), 1) if len(r) else np.nan
+                round(float(r["dur"].median()), 1)
+                if len(r) else np.nan
             ),
             "Presence s": round(float(r["dur"].sum()), 1),
             "Stationary s": round(float(r["still"].sum()), 1),
             "Stop rate %": (
-                round(100 * stoppers / visitors, 1) if visitors else 0.0
+                round(100 * stoppers / visitors, 1)
+                if visitors else 0.0
             ),
             "Peak occupancy": peak,
             "Congested s": cong,
             "Median speed": (
-                round(med_speed, 3) if np.isfinite(med_speed) else np.nan
+                round(med_speed, 3)
+                if np.isfinite(med_speed) else np.nan
             ),
         })
 
@@ -482,7 +432,7 @@ def area_table(t, runs, areas, occ_thr, persist_s):
 
     mean_share = df["Share %"].mean()
     med_visit = df["Median visit s"].median()
-    enough = total >= 10 and len(df) >= 3
+    enough = total >= 5 and len(df) >= 3
 
     statuses = []
     severities = []
@@ -506,8 +456,7 @@ def area_table(t, runs, areas, occ_thr, persist_s):
         ):
             status = "Congestion candidate"
 
-            # Severity is relative to the dashboard's occupancy threshold
-            # and image-coordinate speed; these are not physical m/s values.
+            # Original severity thresholds.
             if (
                 r["Peak occupancy"] >= 2 * occ_thr
                 and r["Median speed"] < 0.02
@@ -550,8 +499,6 @@ def area_table(t, runs, areas, occ_thr, persist_s):
     df["Severity"] = severities
 
     return df
-
-
 
 def flow_tables(runs):
     r = runs[runs["area"] != OTHER].sort_values(["track_id", "t0"]).copy()
@@ -656,7 +603,7 @@ def render(tracks, meta, areas, synthetic, background=None):
         st.warning("No tracked people (track IDs missing). Try a clearer video.")
         return
     runs = build_runs(t, min_visit)
-    at = area_table(t, runs, areas)
+    at = area_table(t, runs, areas, occ_thr, persist_s)
     flows, paths, entries, exits = flow_tables(runs)
     q = quality_stats(tracks, t)
     total_sys = int(runs.loc[runs["area"] != OTHER, "track_id"].nunique())
