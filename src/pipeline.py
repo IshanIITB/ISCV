@@ -17,7 +17,12 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from .calibration import load_calibration, undistort_frame, acceptance_gate
+from .calibration import (
+    load_calibration,
+    undistort_frame,
+    acceptance_gate,
+    is_in_trust_mask,
+)
 from .detection import PersonDetector
 from .tracking import PersonTracker
 from .floor_position import proxy_point, map_to_floor, detection_quality
@@ -294,38 +299,45 @@ def run(
                     box, cfg.get("camera", {}).get("foot_point_proxy", "bottom_center")
                 )
                 floor_x, floor_y = map_to_floor(point, homography)
-                quality = detection_quality(
-                    box,
-                    float(confidence),
-                    frame.shape,
-                    True,
-                    cfg.get("detection", {}).get("confidence", 0.35),
-                )
-                zone = assign_zone(
-                    floor_x,
-                    floor_y,
-                    zones,
-                    cfg.get("zone_settings", {}).get("buffer_m", 0.15),
-                )
-                rows.append(
-                    {
-                        "timestamp": current_index / fps,
-                        "frame_index": current_index,
-                        "track_id": tid,
-                        "camera_id": cfg.get("camera", {}).get("id", "camera_01"),
-                        "x_m": floor_x,
-                        "y_m": floor_y,
-                        "zone": zone,
-                        "confidence": float(confidence),
-                        "low_quality": bool(
-                            quality
-                            or tracker.quality(tid).get("low_confidence_fragment", False)
-                        ),
-                        # This prototype does not yet query the spatial trust mask.
-                        "in_trust_mask": False,
-                        "speed_mps": np.nan,
-                    }
-                )
+            in_trust_mask = is_in_trust_mask(
+                floor_x,
+                floor_y,
+                calib.get("trust_mask"),
+            )
+
+            quality = detection_quality(
+                box,
+                float(confidence),
+                frame.shape,
+                in_trust_mask,
+                cfg.get("detection", {}).get("confidence", 0.35),
+            )
+
+            zone = assign_zone(
+                floor_x,
+                floor_y,
+                zones,
+                cfg.get("zone_settings", {}).get("buffer_m", 0.15),
+            )
+
+            rows.append(
+                {
+                    "timestamp": current_index / fps,
+                    "frame_index": current_index,
+                    "track_id": tid,
+                    "camera_id": cfg.get("camera", {}).get("id", "camera_01"),
+                    "x_m": floor_x,
+                    "y_m": floor_y,
+                    "zone": zone,
+                    "confidence": float(confidence),
+                    "low_quality": bool(
+                        quality
+                        or tracker.quality(tid).get("low_confidence_fragment", False)
+                    ),
+                    "in_trust_mask": in_trust_mask,
+                    "speed_mps": np.nan,
+                }
+            )
 
             sampled_frames += 1
             if debug_video:

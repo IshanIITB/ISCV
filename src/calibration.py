@@ -101,3 +101,42 @@ def checkerboard_calibration(images: list[str], pattern_size: tuple[int,int], sq
         raise ValueError("Need at least five images with a detected checkerboard.")
     _, matrix, dist, _, _ = cv2.calibrateCamera(objpoints,imgpoints,image_size,None,None)
     return matrix, dist
+
+
+
+def is_in_trust_mask(
+    x_m: float,
+    y_m: float,
+    trust_mask: dict | None,
+) -> bool:
+    """Return whether a floor coordinate lies in a trusted calibration cell."""
+    if not trust_mask:
+        return False
+
+    try:
+        xs = np.asarray(trust_mask["x_m"], dtype=float)
+        ys = np.asarray(trust_mask["y_m"], dtype=float)
+        trusted = np.asarray(trust_mask["trusted"], dtype=bool)
+
+        if (
+            xs.size == 0
+            or ys.size == 0
+            or trusted.shape != (ys.size, xs.size)
+            or not np.isfinite(x_m)
+            or not np.isfinite(y_m)
+        ):
+            return False
+
+        # Use the nearest grid coordinate, but reject points outside the grid.
+        if x_m < xs.min() or x_m > xs.max():
+            return False
+        if y_m < ys.min() or y_m > ys.max():
+            return False
+
+        xi = int(np.argmin(np.abs(xs - x_m)))
+        yi = int(np.argmin(np.abs(ys - y_m)))
+
+        return bool(trusted[yi, xi])
+
+    except (KeyError, TypeError, ValueError):
+        return False

@@ -37,3 +37,23 @@ def test_dead_zone_insufficient_baseline():
     current=pd.DataFrame([{"zone":"a","track_count_approx":0}])
     baseline=pd.DataFrame([{"zone":"a","track_count_approx":2}])
     assert compare_zone_baseline(current,baseline)[0]["status"]=="insufficient_data"
+
+
+from src.calibration import is_in_trust_mask
+
+
+def test_trust_mask_lookup():
+    mask = {
+        "x_m": [0.0, 1.0, 2.0],
+        "y_m": [0.0, 1.0],
+        "trusted": [
+            [True, False, True],
+            [False, True, True],
+        ],
+    }
+
+    assert is_in_trust_mask(0.0, 0.0, mask) is True
+    assert is_in_trust_mask(1.0, 0.0, mask) is False
+    assert is_in_trust_mask(1.0, 1.0, mask) is True
+    assert is_in_trust_mask(5.0, 0.0, mask) is False
+    assert is_in_trust_mask(0.0, 0.0, None) is False
