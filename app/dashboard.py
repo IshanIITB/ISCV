@@ -1,291 +1,772 @@
+import hashlib
+import io
+import tempfile
+from pathlib import Path
 
-import streamlit as st
+import cv2
 import numpy as np
 import pandas as pd
+import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+from scipy.ndimage import gaussian_filter, label as nd_label
+from PIL import Image
 
-st.set_page_config(
-    page_title="StoreFlow | Store Analytics",
-    page_icon="🗺️",
-    layout="wide",
-)
+st.set_page_config(page_title="StoreFlow | Dwell-Time Analytics", page_icon="🗺️", layout="wide")
+
+st.markdown("""
+<style>
+.stApp { background: #f7f3e9; color: #292720; }
+[data-testid="stSidebar"] { background: #eee7d8; }
+[data-testid="stMetric"] { background: #fffdf7; border: 1px solid #e5dece;
+    padding: 14px; border-radius: 12px; }
+.block-container { padding-top: 1.4rem; max-width: 1800px; }
+h1, h2, h3 { color: #292720; }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+STILL_SPEED = 0.03   # frame-widths/s below which a person counts as stationary
+MIN_STOP_S = 3.0     # stationary seconds needed to count as a "stop"
+BIN_S = 5            # seconds per occupancy bin
+OTHER = "Open floor"
+MAX_IMG_SIDE = 768   # images sent to the vision model are shrunk to this (keeps CPU runs feasible)
+
+VLM_MODELS = {
+    "SmolVLM-500M (fastest, weakest)": "HuggingFaceTB/SmolVLM-500M-Instruct",
+    "Qwen2-VL-2B (balanced)": "Qwen/Qwen2-VL-2B-Instruct",
+    "Qwen2.5-VL-3B (best, slow on CPU)": "Qwen/Qwen2.5-VL-3B-Instruct",
+}
+
+STATUS_COLOR = {
+    "Congestion candidate": "#c0392b",
+    "Dead-zone candidate": "#7f8c8d",
+    "Hot / high engagement": "#d68910",
+    "High traffic, few stops": "#2471a3",
+}
+
+VLM_PROMPT = """You are a retail store-layout analyst. You are given:
+IMAGE 1: a heat map of where shoppers were observed (red/orange = more presence, transparent = little or none). Coloured rectangles are store areas: red = congestion candidate, grey = dead-zone candidate, orange = high engagement, blue = high traffic but few stops.
+{frame_line}
+Below are the measured numbers from people tracking. Use them together with what you SEE in the images. Never invent numbers.
+
+{facts}
+
+Write a clear report in plain text with these sections:
+1. WHAT THE HEAT MAP SHOWS: describe in simple words where customers actually go, which areas are busy, which are empty, and which routes are visible.
+2. WHAT IS HAPPENING AND WHY: explain the patterns. Start each statement with "Observed:" (visible in the images or numbers) or "Hypothesis:" (a possible reason that must be checked in the store).
+3. PROBLEMS FOUND: queues, crowding, ignored areas, wasted space, dead ends.
+4. HOW TO IMPROVE THE STORE: five concrete actions. For each one give the metric that would show it worked.
+5. WHAT TO CHECK BEFORE ACTING: data limits (tracking errors, no validation, synthetic data, camera coverage).
+Be specific and brief. If the data is synthetic or not validated, say so at the start."""
+
+# =========================================================
+# SIDEBAR (two tabs)
+# =========================================================
+st.sidebar.title("🗺️ StoreFlow")
+page = st.sidebar.radio("Mode", ["📹 Recorded video", "🧪 Synthetic demo"], label_visibility="collapsed")
+synthetic_mode = page.startswith("🧪")
+
+with st.sidebar.expander("Analysis settings", expanded=False):
+    min_visit = st.slider("Min. seconds to count as a visit", 1, 10, 3)
+    occ_thr = st.slider("Congestion: people at once", 2, 12, 3)
+    persist_s = st.slider("Congestion: must last (s)", 10, 180, 30)
+    show_paths = st.checkbox("Show movement paths on heat map", value=False)
+    show_labels = st.checkbox("Show area labels", value=True)
+
+with st.sidebar.expander("AI vision analyst", expanded=False):
+    vlm_label = st.selectbox("Hugging Face vision model", list(VLM_MODELS), index=1)
+    vlm_name = VLM_MODELS[vlm_label]
+
+uploaded_video = None
+if not synthetic_mode:
+    uploaded_video = st.sidebar.file_uploader("Upload store video", type=["mp4", "avi", "mov", "mkv"])
 
 st.title("StoreFlow")
 st.caption("Dwell-Time & Bottleneck Mapper")
 
-mode = st.sidebar.selectbox(
-    "Data source",
-    ["Synthetic demo", "Recorded video"],
-)
-
-uploaded_video = None
-
-if mode == "Recorded video":
-    uploaded_video = st.sidebar.file_uploader(
-        "Upload store video",
-        type=["mp4", "avi", "mov", "mkv"],
-    )
-
-    if uploaded_video is not None:
-        st.video(uploaded_video)
-        st.info(
-            "Video loaded. Person detection and tracking "
-            "will be connected in the next step."
-        )
-
-st.sidebar.subheader("Map settings")
-show_heatmap = st.sidebar.checkbox("Show traffic heatmap", True)
-show_zones = st.sidebar.checkbox("Show zone labels", True)
+# =========================================================
+# DRAWING HELPERS
+# =========================================================
+def make_density(x, y, width, height, bins=120):
+    bins_y = max(30, round(bins * height / width))
+    hist, xe, ye = np.histogram2d(x, y, bins=[bins, bins_y], range=[[0, width], [0, height]])
+    return gaussian_filter(hist, sigma=2.5), xe, ye
 
 
-if mode == "Recorded video":
-    if uploaded_video is None:
-        st.info("Upload a video in the sidebar to begin.")
-        st.stop()
+def draw_density(ax, density, xe, ye, background=None):
+    peak = float(density.max())
+    if peak <= 0:
+        return
+    if background is not None:
+        ax.imshow(background, extent=(xe[0], xe[-1], ye[-1], ye[0]), aspect="auto")
+    image = np.ma.masked_where(density < peak * 0.08, density)
+    cmap = plt.get_cmap("YlOrRd").copy()
+    cmap.set_bad((1, 1, 1, 0))
+    mesh = ax.pcolormesh(xe, ye, image.T, cmap=cmap, shading="auto", vmin=0, vmax=peak,
+                         alpha=0.6 if background is not None else 0.92)
+    plt.colorbar(mesh, ax=ax, label="Relative presence (observations, not unique visitors)",
+                 fraction=0.035, pad=0.02)
 
-    import cv2
-    import tempfile
-    from pathlib import Path
+
+def draw_areas(ax, at, areas, labels=True):
+    status = dict(zip(at["Area"], at["Status"])) if len(at) else {}
+    for a in areas:
+        x1, y1, x2, y2 = a["bounds"]
+        col = STATUS_COLOR.get(status.get(a["name"]), "#655847")
+        ax.add_patch(Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor=col, linewidth=2.2))
+        if labels:
+            ax.text((x1 + x2) / 2, (y1 + y2) / 2, a["name"], ha="center", va="center",
+                    fontsize=9, color="#382719",
+                    bbox=dict(facecolor="#fff4d8", alpha=0.92, edgecolor="#d8b477", boxstyle="round,pad=0.3"))
+
+
+def fig_to_pil(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+
+def shrink(img, max_side=MAX_IMG_SIDE):
+    img = img.copy()
+    img.thumbnail((max_side, max_side))
+    return img
+
+# =========================================================
+# VIDEO PROCESSING
+# =========================================================
+def process_video(video_bytes, filename, sample_fps=5):
     from ultralytics import YOLO
 
-    st.subheader("Person detection and tracking")
-    st.caption(
-        "YOLO + ByteTrack · Processing uploaded footage"
-    )
-
-    if st.button("Run detection", type="primary"):
-        suffix = Path(uploaded_video.name).suffix or ".mp4"
-
-        with tempfile.NamedTemporaryFile(
-            suffix=suffix, delete=False
-        ) as temp:
-            temp.write(uploaded_video.getvalue())
+    video_path, cap = None, None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=Path(filename).suffix or ".mp4", delete=False) as temp:
+            temp.write(video_bytes)
             video_path = temp.name
 
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError("Could not open the uploaded video.")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if not np.isfinite(fps) or fps <= 0 or total <= 0:
+            raise RuntimeError("Video metadata is invalid.")
+
+        duration = total / fps
+        model = YOLO("yolo11n.pt")
+        rows, unique_ids = [], set()
+        preview, clean, objects = None, None, []
+        frame_no = 0
+        stride = max(1, round(fps / sample_fps))
+        progress, status = st.progress(0), st.empty()
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_no % stride == 0:
+                result = model.track(frame, persist=True, tracker="bytetrack.yaml",
+                                     classes=[0], conf=0.35, verbose=False)[0]
+                boxes = result.boxes
+                if boxes is not None and len(boxes) > 0:
+                    coords = boxes.xyxy.cpu().numpy()
+                    ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [-1] * len(coords)
+                    for box, tid in zip(coords, ids):
+                        rows.append({"timestamp": frame_no / fps, "track_id": int(tid),
+                                     "x_px": float((box[0] + box[2]) / 2), "y_px": float(box[3])})
+                        if tid >= 0:
+                            unique_ids.add(tid)
+                if preview is None:
+                    preview = cv2.cvtColor(result.plot(), cv2.COLOR_BGR2RGB)
+                    clean = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    fr = model.predict(frame, classes=[72], conf=0.25, verbose=False)[0]  # refrigerator
+                    objects = [{"name": "Fridge", "bounds": tuple(map(float, b))}
+                               for b in fr.boxes.xyxy.cpu().numpy()]
+            frame_no += 1
+            if frame_no % 10 == 0:
+                progress.progress(min(frame_no / total, 1.0))
+                status.write(f"Processing {frame_no:,}/{total:,} frames")
+
+        progress.progress(1.0)
+        cap.release()
         cap = None
-
-        try:
-            cap = cv2.VideoCapture(video_path)
-
-            if not cap.isOpened():
-                st.error("Could not open this video file.")
-                st.stop()
-
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(
-                cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            )
-
-            if fps <= 0 or total_frames <= 0:
-                st.error("The video has invalid frame metadata.")
-                st.stop()
-
-            duration = total_frames / fps
-
-            st.write(
-                f"Duration: {duration:.1f} seconds · "
-                f"Frame rate: {fps:.1f} FPS"
-            )
-
-            model = YOLO("yolo11n.pt")
-            frame_view = st.empty()
-            progress = st.progress(0)
-            status = st.empty()
-
-            seen_ids = set()
-            frame_index = 0
-            current_count = 0
-
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-
-                result = model.track(
-                    frame,
-                    persist=True,
-                    tracker="bytetrack.yaml",
-                    classes=[0],
-                    conf=0.35,
-                    verbose=False,
-                )[0]
-
-                if result.boxes is not None:
-                    current_count = len(result.boxes)
-
-                    if result.boxes.id is not None:
-                        ids = (
-                            result.boxes.id
-                            .int()
-                            .cpu()
-                            .tolist()
-                        )
-                        seen_ids.update(ids)
-                else:
-                    current_count = 0
-
-                # Display every third frame; process every frame.
-                if frame_index % 3 == 0:
-                    annotated = result.plot()
-                    rgb = cv2.cvtColor(
-                        annotated, cv2.COLOR_BGR2RGB
-                    )
-
-                    frame_view.image(
-                        rgb,
-                        channels="RGB",
-                        use_container_width=True,
-                    )
-
-                    status.write(
-                        f"Frame {frame_index + 1}/{total_frames} "
-                        f"· People in current frame: {current_count} "
-                        f"· Unique track IDs seen: {len(seen_ids)}"
-                    )
-
-                    progress.progress(
-                        min(
-                            (frame_index + 1) / total_frames,
-                            1.0,
-                        )
-                    )
-
-                frame_index += 1
-
-            progress.progress(1.0)
-            st.success("Video processing complete.")
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Frames processed", frame_index)
-            col2.metric("Unique track IDs", len(seen_ids))
-            col3.metric("Video duration", f"{duration:.1f} s")
-
-            st.caption(
-                "Track IDs are approximate counts of identities "
-                "tracked during this clip, not guaranteed unique "
-                "customer counts."
-            )
-
-        finally:
-            if cap is not None:
-                cap.release()
-
+        if not rows:
+            raise RuntimeError("No people were detected. Try a clearer video.")
+        return (pd.DataFrame(rows), width, height, fps, duration, len(unique_ids), preview, clean, objects)
+    finally:
+        if cap is not None:
+            cap.release()
+        if video_path and Path(video_path).exists():
             Path(video_path).unlink(missing_ok=True)
 
-    st.stop()
 
+def auto_areas(tracks, width, height, objects=None):
+    """Find hotspots and name them from how people behave there."""
+    t = tracks[tracks["track_id"] >= 0].sort_values(["track_id", "timestamp"]).copy()
+    if t.empty:
+        return [{"name": f"{o['name']} {k}", "bounds": o["bounds"]} for k, o in enumerate(objects or [], 1)]
 
-# Demo floor plan: coordinates are illustrative, in metres.
-zones = [
-    {"name": "Produce", "x": 1, "y": 7, "w": 4, "h": 3},
-    {"name": "Aisle A", "x": 6, "y": 7, "w": 2, "h": 6},
-    {"name": "Aisle B", "x": 9, "y": 7, "w": 2, "h": 6},
-    {"name": "Dairy", "x": 12, "y": 7, "w": 3, "h": 3},
-    {"name": "Checkout", "x": 11, "y": 1, "w": 5, "h": 3},
-    {"name": "Entrance", "x": 1, "y": 1, "w": 3, "h": 2},
+    g = t.groupby("track_id")
+    dt = g["timestamp"].diff()
+    t["speed"] = np.hypot(g["x_px"].diff(), g["y_px"].diff()) / dt
+
+    density, xe, ye = make_density(t["x_px"].to_numpy(), t["y_px"].to_numpy(), width, height)
+    labels, n = nd_label(density >= density.max() * 0.30)
+    ends = pd.concat([g.head(1), g.tail(1)])
+    zones, counts = [], {}
+
+    for i in range(1, n + 1):
+        xs, ys = np.where(labels == i)
+        if len(xs) < 15:
+            continue
+        x1, x2 = xe[xs.min()], xe[xs.max() + 1]
+        y1, y2 = ye[ys.min()], ye[ys.max() + 1]
+
+        def inside(d, x1=x1, x2=x2, y1=y1, y2=y2):
+            return d["x_px"].between(x1, x2) & d["y_px"].between(y1, y2)
+
+        sub = t[inside(t)]
+        if sub["track_id"].nunique() < 2:
+            continue
+        speed = sub["speed"].median() / width
+        dwell = sub.groupby("track_id")["timestamp"].agg(lambda s: s.max() - s.min()).median()
+        w, h = x2 - x1, y2 - y1
+        elong = max(w / h, h / w)
+        end_frac = inside(ends).sum() / max(1, len(ends))
+        near_edge = (x1 < 0.08 * width or x2 > 0.92 * width or y1 < 0.08 * height or y2 > 0.92 * height)
+
+        if near_edge and end_frac > 0.25:
+            kind = "Entrance / Exit"
+        elif speed < 0.03 and dwell > 5:
+            kind = "Counter / Queue"
+        elif elong > 1.8 and speed >= 0.03:
+            kind = "Aisle"
+        else:
+            kind = "Shelf / Browsing area"
+        counts[kind] = counts.get(kind, 0) + 1
+        zones.append({"name": f"{kind} {counts[kind]}",
+                      "bounds": (max(0, x1), max(0, y1), min(width, x2), min(height, y2))})
+
+    for k, obj in enumerate(objects or [], 1):
+        zones.append({"name": f"{obj['name']} {k}", "bounds": obj["bounds"]})
+    return zones
+
+# =========================================================
+# SYNTHETIC DATA (clearly fake; demo only)
+# =========================================================
+SYN_W, SYN_H = 17.0, 15.0
+SYN_AREAS = [
+    {"name": "Entrance", "bounds": (1, 12, 4, 14.5)},
+    {"name": "Produce", "bounds": (1, 2, 5, 5)},
+    {"name": "Aisle 1", "bounds": (6, 2, 8, 9)},
+    {"name": "Aisle 2", "bounds": (9, 2, 11, 9)},
+    {"name": "Dairy", "bounds": (12, 2, 15.5, 5)},
+    {"name": "Checkout", "bounds": (11, 11, 16, 14)},
 ]
 
-rng = np.random.default_rng(42)
-people = pd.DataFrame({
-    "x": rng.uniform(0.5, 16, 128),
-    "y": rng.uniform(0.5, 14, 128),
-})
 
-# Simulate heavier traffic around checkout and Aisle A.
-people.loc[:34, ["x", "y"]] = np.column_stack([
-    rng.normal(13.2, 0.8, 35),
-    rng.normal(2.4, 0.6, 35),
-])
-people.loc[35:59, ["x", "y"]] = np.column_stack([
-    rng.normal(7, 0.5, 25),
-    rng.uniform(7, 13, 25),
-])
-people["x"] = people["x"].clip(0.2, 16.8)
-people["y"] = people["y"].clip(0.2, 14.8)
+@st.cache_data(show_spinner=False)
+def simulate_store(seed=42, n=140):
+    rng = np.random.default_rng(seed)
+    bounds = {a["name"]: a["bounds"] for a in SYN_AREAS}
+    browse = ["Produce", "Aisle 1", "Aisle 2", "Dairy"]
+    weights = [0.30, 0.40, 0.05, 0.25]  # Aisle 2 is deliberately ignored
+    rows = []
+    for tid in range(1, n + 1):
+        t = rng.uniform(0, 1200) if rng.random() < 0.5 else rng.normal(900, 80)  # rush near t=900
+        b = bounds["Entrance"]
+        pos = np.array([(b[0] + b[2]) / 2, (b[1] + b[3]) / 2])
+        stops = list(rng.choice(browse, size=int(rng.integers(1, 4)), replace=False, p=weights)) + ["Checkout"]
+        for name in stops:
+            x1, y1, x2, y2 = bounds[name]
+            target = np.array([rng.uniform(x1, x2), rng.uniform(y1, y2)])
+            steps = max(1, int(np.linalg.norm(target - pos) / 1.3))
+            for s in range(1, steps + 1):
+                p = pos + (target - pos) * s / steps + rng.normal(0, 0.08, 2)
+                rows.append((t, tid, p[0], p[1]))
+                t += 1
+            pos = target
+            dwell = int(rng.gamma(5, 6)) if name == "Checkout" else int(rng.gamma(4, 2.5))
+            for _ in range(dwell):
+                p = pos + rng.normal(0, 0.1, 2)
+                rows.append((t, tid, p[0], p[1]))
+                t += 1
+    df = pd.DataFrame(rows, columns=["timestamp", "track_id", "x_px", "y_px"])
+    df["timestamp"] -= df["timestamp"].min()
+    return df
 
-a, b, c = st.columns(3)
-a.metric("People detected", "128", help="Synthetic demo value")
-b.metric("Average dwell time", "2m 34s", help="Illustrative value")
-c.metric("Potential bottlenecks", "2", help="Synthetic demo alerts")
+# =========================================================
+# ANALYTICS
+# =========================================================
+def prepare(tracks, areas, width):
+    t = tracks[tracks["track_id"] >= 0].sort_values(["track_id", "timestamp"]).copy()
+    if t.empty:
+        return t, 1.0
+    g = t.groupby("track_id")
+    for c in ("x_px", "y_px"):
+        t[c + "_s"] = g[c].transform(lambda s: s.rolling(3, center=True, min_periods=1).median())
+    g = t.groupby("track_id")
+    dt = g["timestamp"].diff()
+    dist = np.hypot(g["x_px_s"].diff(), g["y_px_s"].diff())
+    t["speed"] = (dist / dt / width).where(dt > 0)
+    t["speed"] = t.groupby("track_id")["speed"].transform(lambda s: s.rolling(3, center=True, min_periods=1).median())
+    interval = float(np.nanmedian(dt)) if dt.notna().any() else 1.0
+    interval = interval if interval > 0 else 1.0
+    nxt = t.groupby("track_id")["timestamp"].shift(-1) - t["timestamp"]
+    t["dur"] = nxt.clip(upper=interval * 2.5).fillna(0.0)
 
-st.subheader("Store floor heatmap")
-st.caption("Synthetic data — not connected to a real camera yet.")
+    t["area"] = OTHER
+    size = lambda a: (a["bounds"][2] - a["bounds"][0]) * (a["bounds"][3] - a["bounds"][1])
+    for a in sorted(areas, key=size, reverse=True):  # smaller areas win overlaps
+        x1, y1, x2, y2 = a["bounds"]
+        m = t["x_px_s"].between(x1, x2) & t["y_px_s"].between(y1, y2)
+        t.loc[m, "area"] = a["name"]
+    return t, interval
 
-fig, ax = plt.subplots(figsize=(12, 7))
 
-if show_heatmap:
-    ax.hist2d(
-        people["x"],
-        people["y"],
-        bins=[34, 28],
-        range=[[0, 17], [0, 15]],
-        cmap="YlOrRd",
-        alpha=0.78,
+def build_runs(t, min_visit):
+    prev = t.groupby("track_id")["area"].shift()
+    t["run"] = (t["area"] != prev).cumsum()
+    t["still_dur"] = np.where(t["speed"] < STILL_SPEED, t["dur"], 0.0)
+    runs = t.groupby("run").agg(track_id=("track_id", "first"), area=("area", "first"),
+                                t0=("timestamp", "min"), dur=("dur", "sum"),
+                                still=("still_dur", "sum"), n=("timestamp", "size")).reset_index(drop=True)
+    return runs[(runs["n"] >= 2) & (runs["dur"] >= min_visit)]
+
+
+def area_table(t, runs, areas, occ_thr, persist_s):
+    valid = runs[runs["area"] != OTHER]
+    total = max(1, valid["track_id"].nunique())
+    rows = []
+    for a in areas:
+        name = a["name"]
+        r = runs[runs["area"] == name]
+        rt = t[t["area"] == name]
+        visitors = r["track_id"].nunique()
+        stoppers = r.loc[r["still"] >= MIN_STOP_S, "track_id"].nunique()
+        if len(rt):
+            occ = rt.groupby(rt["timestamp"] // BIN_S)["track_id"].nunique()
+            peak, cong = int(occ.max()), int((occ >= occ_thr).sum()) * BIN_S
+            med_speed = float(rt["speed"].median())
+        else:
+            peak, cong, med_speed = 0, 0, np.nan
+        rows.append({
+            "Area": name, "Visitors": visitors,
+            "Share %": round(100 * visitors / total, 1),
+            "Median visit s": round(float(r["dur"].median()), 1) if len(r) else np.nan,
+            "Presence s": round(float(r["dur"].sum()), 1),
+            "Stationary s": round(float(r["still"].sum()), 1),
+            "Stop rate %": round(100 * stoppers / visitors, 1) if visitors else 0.0,
+            "Peak occupancy": peak, "Congested s": cong,
+            "Median speed": round(med_speed, 3) if np.isfinite(med_speed) else np.nan,
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df["Status"] = []
+        return df
+
+    mean_share = df["Share %"].mean()
+    med_visit = df["Median visit s"].median()
+    enough = total >= 10 and len(df) >= 3
+    statuses = []
+    for _, r in df.iterrows():
+        is_gate = any(k in r["Area"].lower() for k in ("entr", "exit"))
+        if not enough:
+            s = "Not enough data"
+        elif r["Congested s"] >= persist_s and (pd.isna(r["Median speed"]) or r["Median speed"] < 0.06):
+            s = "Congestion candidate"
+        elif is_gate:
+            s = "Normal"
+        elif r["Share %"] < 0.35 * mean_share:
+            s = "Dead-zone candidate"
+        elif r["Stop rate %"] >= 60 and r["Median visit s"] > med_visit:
+            s = "Hot / high engagement"
+        elif r["Share %"] >= mean_share and r["Stop rate %"] < 25:
+            s = "High traffic, few stops"
+        else:
+            s = "Normal"
+        statuses.append(s)
+    df["Status"] = statuses
+    return df
+
+
+def flow_tables(runs):
+    r = runs[runs["area"] != OTHER].sort_values(["track_id", "t0"]).copy()
+    if r.empty:
+        e = pd.Series(dtype=int)
+        return pd.DataFrame(columns=["Move", "People"]), e, e, e
+    r = r[r["area"] != r.groupby("track_id")["area"].shift()]
+    r["next"] = r.groupby("track_id")["area"].shift(-1)
+    flows = (r.dropna(subset=["next"]).groupby(["area", "next"]).size()
+             .reset_index(name="People").sort_values("People", ascending=False))
+    flows["Move"] = flows["area"] + " → " + flows["next"]
+    paths = r.groupby("track_id")["area"].apply(lambda s: " → ".join(s)).value_counts().head(5)
+    entries = r.groupby("track_id")["area"].first().value_counts()
+    exits = r.groupby("track_id")["area"].last().value_counts()
+    return flows[["Move", "People"]].head(10), paths, entries, exits
+
+
+def quality_stats(tracks, t):
+    life = t.groupby("track_id")["timestamp"].agg(lambda s: s.max() - s.min())
+    return {
+        "untracked_pct": round(100 * float((tracks["track_id"] < 0).mean()), 1),
+        "short_track_pct": round(100 * float((life < 3).mean()), 1) if len(life) else 0.0,
+        "track_ids": int(t["track_id"].nunique()),
+    }
+
+
+def rule_findings(at, entries, exits, paths):
+    recs = at.to_dict("records")
+    out = []
+    if not recs:
+        return out
+    byv = sorted(recs, key=lambda r: r["Visitors"], reverse=True)
+    out.append(f"**Where people go:** {byv[0]['Area']} gets the most visitors ({byv[0]['Share %']:.0f}% of "
+               f"shoppers); {byv[-1]['Area']} gets the fewest ({byv[-1]['Share %']:.0f}%).")
+    if len(entries) and len(exits):
+        out.append(f"**Entry / exit:** most shoppers start in **{entries.index[0]}** and finish in **{exits.index[0]}**.")
+    if len(paths):
+        out.append(f"**Most common route:** {paths.index[0]} ({int(paths.iloc[0])} shoppers).")
+    for r in recs:
+        s = r["Status"]
+        if s == "Congestion candidate":
+            out.append(f"🔴 **{r['Area']}**: up to {r['Peak occupancy']} people at once, congested for "
+                       f"{r['Congested s']:.0f}s. Consider more capacity, a wider approach, or spreading demand.")
+        elif s == "Dead-zone candidate":
+            out.append(f"⚪ **{r['Area']}**: only {r['Share %']:.0f}% of shoppers. Check for stockouts, blocked "
+                       f"access, poor sightlines or camera coverage before acting.")
+        elif s == "High traffic, few stops":
+            out.append(f"🔵 **{r['Area']}**: {r['Share %']:.0f}% of shoppers pass but only {r['Stop rate %']:.0f}% "
+                       f"stop. Good spot to test a promo display or better signage.")
+        elif s == "Hot / high engagement":
+            out.append(f"🟠 **{r['Area']}**: {r['Stop rate %']:.0f}% stop, median visit {r['Median visit s']}s. "
+                       f"Protect this space and test adjacent complementary products.")
+    return out
+
+
+def facts_text(at, flows, paths, entries, exits, q, source, validation):
+    val = "NOT validated against manual counts yet." if validation is None else (
+        f"Validated: mean abs count error {validation['count_err']:.0f}%"
+        + (f", dwell error {validation['dwell_err']:.0f}%" if validation.get("dwell_err") is not None else "") + ".")
+    return (
+        f"DATA SOURCE: {source}\nVALIDATION: {val}\n"
+        f"TRACK QUALITY: {q['track_ids']} track IDs, {q['untracked_pct']}% detections untracked, "
+        f"{q['short_track_pct']}% tracks shorter than 3s (possible ID switches).\n"
+        "NOTES: speeds are frame-widths/second, not m/s. Visitors are approximate (ID switches inflate them). "
+        "Stop = stationary >=3s. Status labels are rule-based candidates, not verdicts.\n\n"
+        f"AREA TABLE (CSV):\n{at.to_csv(index=False)}\n"
+        f"TOP AREA-TO-AREA MOVES:\n{flows.to_csv(index=False)}\n"
+        f"COMMON ROUTES:\n{paths.to_string()}\n\n"
+        f"FIRST AREA ENTERED:\n{entries.to_string()}\n\nLAST AREA VISITED:\n{exits.to_string()}\n"
     )
 
-for z in zones:
-    rect = Rectangle(
-        (z["x"], z["y"]),
-        z["w"],
-        z["h"],
-        linewidth=1.5,
-        edgecolor="#263238",
-        facecolor="none",
-    )
-    ax.add_patch(rect)
+# =========================================================
+# VISION-LANGUAGE MODEL (sees the heat map + video frame)
+# =========================================================
+@st.cache_resource(show_spinner=False)
+def load_vlm(name):
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+    cuda = torch.cuda.is_available()
+    processor = AutoProcessor.from_pretrained(name)
+    model = AutoModelForImageTextToText.from_pretrained(
+        name, torch_dtype=torch.float16 if cuda else torch.float32)
+    model.to("cuda" if cuda else "cpu").eval()
+    return processor, model
 
-    if show_zones:
-        ax.text(
-            z["x"] + z["w"] / 2,
-            z["y"] + z["h"] / 2,
-            z["name"],
-            ha="center",
-            va="center",
-            fontsize=9,
-            color="#111111",
-            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
-        )
 
-# Illustrative shelf blocks.
-for x in [6.2, 9.2]:
-    for y in [8, 10, 12]:
-        ax.add_patch(Rectangle(
-            (x, y), 1.6, 0.65,
-            facecolor="#78909c",
-            edgecolor="#455a64",
-        ))
+def run_vlm(name, images, prompt):
+    import torch
+    processor, model = load_vlm(name)
+    images = [shrink(i) for i in images]
+    content = [{"type": "image"} for _ in images] + [{"type": "text", "text": prompt}]
+    messages = [{"role": "user", "content": content}]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    # SmolVLM expects one list of images per prompt; Qwen-VL takes a flat list.
+    img_arg = [images] if "smol" in name.lower() else images
+    inputs = processor(text=[text], images=img_arg, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=800, do_sample=False)
+    new_tokens = out[:, inputs["input_ids"].shape[1]:]
+    return processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
 
-ax.set_xlim(0, 17)
-ax.set_ylim(0, 15)
-ax.set_aspect("equal")
-ax.set_xlabel("Store width (metres)")
-ax.set_ylabel("Store depth (metres)")
-ax.set_facecolor("#fafafa")
-ax.grid(alpha=0.15)
+# =========================================================
+# DASHBOARD RENDERER (shared by both modes)
+# =========================================================
+def render(tracks, meta, areas, synthetic, background=None):
+    width, height = meta["width"], meta["height"]
+    source = ("SYNTHETIC simulated shoppers (NOT real measurements)" if synthetic
+              else "Real video, YOLO + ByteTrack, unvalidated unless stated")
 
-st.pyplot(fig, use_container_width=True)
-plt.close(fig)
+    if synthetic:
+        st.error("🧪 SYNTHETIC DEMO: these shoppers are simulated. Nothing below is a real store measurement. "
+                 "It only shows how the dashboard works. Use the Recorded video tab for real analysis.")
 
-st.subheader("Bottleneck alerts")
+    t, interval = prepare(tracks, areas, width)
+    if t.empty:
+        st.warning("No tracked people (track IDs missing). Try a clearer video.")
+        return
+    runs = build_runs(t, min_visit)
+    at = area_table(t, runs, areas, occ_thr, persist_s)
+    flows, paths, entries, exits = flow_tables(runs)
+    q = quality_stats(tracks, t)
+    total_sys = int(runs.loc[runs["area"] != OTHER, "track_id"].nunique())
 
-alerts = pd.DataFrame([
-    {
-        "Zone": "Checkout",
-        "Condition": "High density / low movement",
-        "Status": "Demo alert",
-    },
-    {
-        "Zone": "Aisle A",
-        "Condition": "Sustained traffic concentration",
-        "Status": "Demo alert",
-    },
-])
+    tab_over, tab_flow, tab_val, tab_ai = st.tabs(["📊 Overview", "🔀 Flow", "✅ Validation", "🤖 AI insights"])
+    validation = None
+    heat_img = None
 
-st.dataframe(alerts, hide_index=True, use_container_width=True)
+    # ---------- OVERVIEW ----------
+    with tab_over:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Duration", f"{meta['duration']:.0f}s")
+        c2.metric("Shoppers (approx.)", total_sys)
+        busiest = at.sort_values("Visitors", ascending=False)["Area"].iloc[0] if len(at) else "-"
+        c3.metric("Busiest area", busiest)
+        flagged = int((~at["Status"].isin(["Normal", "Not enough data"])).sum()) if len(at) else 0
+        c4.metric("Flagged areas", flagged)
 
-st.info(
-    "Next: replace synthetic positions with calibrated person tracks, "
-    "calculate actual zone metrics, and trigger alerts from persistent "
-    "density and speed conditions."
-)
+        if q["short_track_pct"] > 30:
+            st.warning(f"{q['short_track_pct']}% of tracks are shorter than 3s. Likely ID switches or flicker, "
+                       "so visitor counts may be inflated.")
+        if q["untracked_pct"] > 10:
+            st.warning(f"{q['untracked_pct']}% of detections have no track ID and are ignored in area metrics.")
+        if not synthetic:
+            st.info("These numbers are **not validated yet** unless you completed the Validation tab.")
+
+        density, xe, ye = make_density(tracks["x_px"].to_numpy(), tracks["y_px"].to_numpy(), width, height)
+        fig, ax = plt.subplots(figsize=(11, 7))
+        draw_density(ax, density, xe, ye, background=background)
+        draw_areas(ax, at, areas, show_labels)
+        if show_paths:
+            for _, grp in tracks[tracks["track_id"] >= 0].groupby("track_id"):
+                grp = grp.sort_values("timestamp")
+                ax.plot(grp["x_px"], grp["y_px"], alpha=0.3, linewidth=0.8, color="#8b5e91")
+        ax.set_xlim(0, width)
+        ax.set_ylim(height, 0)
+        ax.set_aspect("equal")
+        ax.set_title("SYNTHETIC heat map (simulated)" if synthetic else "Occupancy by image position")
+        ax.set_facecolor("#eee5d3")
+        heat_img = fig_to_pil(fig)   # this exact image is what the AI model will look at
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+        st.caption("Box colours: red = congestion, grey = dead-zone candidate, orange = hot, blue = high traffic/few stops. "
+                   "Heat map shows observed presence, not unique visitors or interest.")
+
+        st.subheader("Area analytics")
+        st.dataframe(at, hide_index=True, use_container_width=True)
+        st.caption("Presence = time inside area. Stationary = time below walking speed. "
+                   "Queueing is not browsing. Speed is in frame-widths/s, not m/s.")
+        st.download_button("Download area analytics CSV", at.to_csv(index=False).encode("utf-8"),
+                           "storeflow_area_analytics.csv", "text/csv")
+
+    # ---------- FLOW ----------
+    with tab_flow:
+        st.subheader("Where customers actually go")
+        if flows.empty:
+            st.info("No area-to-area movement found. Define more areas or use a longer video.")
+        else:
+            a, b = st.columns([3, 2])
+            with a:
+                st.markdown("**Top moves between areas**")
+                st.bar_chart(flows.set_index("Move")["People"])
+            with b:
+                st.markdown("**Most common routes**")
+                st.dataframe(paths.rename("Shoppers").reset_index().rename(columns={"area": "Route"}),
+                             hide_index=True, use_container_width=True)
+            c, d = st.columns(2)
+            c.markdown("**First area entered**")
+            c.dataframe(entries.rename("Shoppers"), use_container_width=True)
+            d.markdown("**Last area visited**")
+            d.dataframe(exits.rename("Shoppers"), use_container_width=True)
+        st.caption("Routes assume one track ID per person. ID switches split journeys, so treat routes as indicative.")
+
+    # ---------- VALIDATION ----------
+    with tab_val:
+        st.subheader("Validate against manually checked video")
+        if synthetic:
+            st.info("Validation only applies to real video. Synthetic data has no real-world ground truth.")
+        else:
+            st.write("Watch the video yourself. For each area, count how many different people entered it and "
+                     "estimate their typical dwell time. Leave blanks for areas you skipped.")
+            base = pd.DataFrame({"Area": at["Area"], "Manual customers": np.nan, "Manual typical dwell (s)": np.nan})
+            ed = st.data_editor(
+                base, hide_index=True, disabled=["Area"], key="val_" + "|".join(at["Area"]),
+                column_config={"Manual customers": st.column_config.NumberColumn(min_value=0, step=1),
+                               "Manual typical dwell (s)": st.column_config.NumberColumn(min_value=0)})
+            manual_total = st.number_input("Manual total customers in the clip (optional)", min_value=0, value=0, step=1)
+
+            m = at[["Area", "Visitors", "Median visit s"]].merge(ed, on="Area")
+            m["Count error %"] = np.where(m["Manual customers"] > 0,
+                                          (m["Visitors"] - m["Manual customers"]) / m["Manual customers"] * 100, np.nan)
+            m["Dwell error %"] = np.where(m["Manual typical dwell (s)"] > 0,
+                                          (m["Median visit s"] - m["Manual typical dwell (s)"]) / m["Manual typical dwell (s)"] * 100,
+                                          np.nan)
+            checked = m.dropna(subset=["Count error %"])
+            tot_err = None
+            if manual_total > 0:
+                tot_err = (total_sys - manual_total) / manual_total * 100
+                st.metric("Total customers: system vs manual", f"{total_sys} vs {manual_total}", f"{tot_err:+.0f}%")
+            if checked.empty and manual_total == 0:
+                st.info("Enter at least one manual count to see accuracy.")
+            else:
+                st.dataframe(m.round(1), hide_index=True, use_container_width=True)
+                errs = [checked["Count error %"].abs().mean()] if not checked.empty else []
+                if tot_err is not None:
+                    errs.append(abs(tot_err))
+                count_err = float(np.mean(errs))
+                dw = m["Dwell error %"].abs().dropna()
+                dwell_err = float(dw.mean()) if len(dw) else None
+                validation = {"count_err": count_err, "dwell_err": dwell_err}
+                st.session_state["sf_validation"] = validation
+                worst = max(count_err, dwell_err or 0)
+                if worst <= 15:
+                    st.success(f"✅ Good: mean count error {count_err:.0f}%.")
+                elif worst <= 30:
+                    st.warning(f"⚠️ Fair: mean count error {count_err:.0f}%. Use for rough trends only.")
+                else:
+                    st.error(f"❌ Poor: mean count error {count_err:.0f}%. Do not base layout decisions on this yet.")
+
+    # ---------- AI INSIGHTS ----------
+    with tab_ai:
+        validation = validation or st.session_state.get("sf_validation")
+        st.subheader("What the data says and what to do")
+        for line in rule_findings(at, entries, exits, paths):
+            st.markdown("- " + line)
+
+        st.divider()
+        st.markdown(f"**AI vision analyst:** `{vlm_name}` looks at the heat map image"
+                    + ("" if synthetic or background is None else " and the video frame")
+                    + ", reads the measured numbers, and writes a report in plain text. "
+                      "It sees the pictures, but its 'why' statements are still hypotheses to check in the store.")
+
+        images, frame_line = [], ""
+        if heat_img is not None:
+            images.append(heat_img)
+        if background is not None and not synthetic:
+            images.append(Image.fromarray(background))
+            frame_line = "IMAGE 2: a plain frame from the store video, so you can relate the heat map to real shelves, counters and doors."
+        else:
+            frame_line = "(No video frame available; this is a simulated floor plan.)" if synthetic else ""
+
+        facts = facts_text(at, flows, paths, entries, exits, q, source, validation)
+        prompt = VLM_PROMPT.format(frame_line=frame_line, facts=facts)
+
+        cols = st.columns(len(images)) if images else []
+        for col, img, cap in zip(cols, images, ["Heat map the AI sees", "Video frame the AI sees"]):
+            col.image(img, caption=cap, use_container_width=True)
+        with st.expander("Numbers sent to the model together with the images"):
+            st.code(facts)
+
+        key = hashlib.md5((vlm_name + facts + str(len(images))).encode()).hexdigest()
+        if st.button("Analyse heat map with AI", type="primary"):
+            try:
+                with st.spinner("Loading vision model (first run downloads it) and analysing the images..."):
+                    st.session_state["ai_" + key] = run_vlm(vlm_name, images, prompt)
+            except Exception as exc:
+                st.error(f"AI analysis failed: {exc}. The rule-based findings above still apply.")
+        if "ai_" + key in st.session_state:
+            st.markdown("### AI report")
+            st.write(st.session_state["ai_" + key])
+            st.caption("AI-generated reading of the images and numbers, not ground truth. "
+                       "Small vision models can misread charts, so check it against the table and your own eyes "
+                       "before changing the store layout.")
+
+# =========================================================
+# PAGES
+# =========================================================
+if synthetic_mode:
+    tracks = simulate_store()
+    meta = {"width": SYN_W, "height": SYN_H, "duration": float(tracks["timestamp"].max()),
+            "fps": 1.0, "ids": int(tracks["track_id"].nunique())}
+    render(tracks, meta, SYN_AREAS, synthetic=True)
+
+else:
+    if uploaded_video is None:
+        st.info("Upload a store video in the sidebar.")
+        st.stop()
+
+    with st.expander("Preview uploaded video", expanded=False):
+        st.video(uploaded_video)
+
+    if st.button("Run Analysis", type="primary"):
+        try:
+            with st.spinner("Detecting and tracking people..."):
+                result = process_video(uploaded_video.getvalue(), uploaded_video.name)
+            (tracks, width, height, fps, duration, ids, preview, clean, objects) = result
+            st.session_state["sf_tracks"] = tracks
+            st.session_state["sf_meta"] = {"width": width, "height": height, "fps": fps,
+                                           "duration": duration, "ids": ids}
+            st.session_state["sf_preview"] = preview
+            st.session_state["sf_clean"] = clean
+            st.session_state["sf_areas"] = auto_areas(tracks, width, height, objects)
+            st.session_state["sf_video_key"] = (uploaded_video.name, len(uploaded_video.getvalue()))
+            st.session_state.pop("sf_validation", None)
+        except Exception as exc:
+            st.error(f"Analysis failed: {exc}")
+            st.stop()
+
+    if "sf_tracks" not in st.session_state:
+        st.info("Click Run Analysis to process the uploaded video.")
+        st.stop()
+
+    if st.session_state.get("sf_video_key") != (uploaded_video.name, len(uploaded_video.getvalue())):
+        st.warning("A different video is selected. Click Run Analysis to replace the previous results.")
+        st.stop()
+
+    tracks = st.session_state["sf_tracks"]
+    meta = st.session_state["sf_meta"]
+    preview = st.session_state["sf_preview"]
+
+    with st.expander("Configure store areas", expanded=not st.session_state.get("sf_areas")):
+        st.caption("Areas are inferred from movement (fridges are detected directly). Counters are inferred, "
+                   "not visually recognised. Draw rectangles over the frame to define your own.")
+        if preview is not None:
+            from streamlit_drawable_canvas import st_canvas
+
+            canvas_height = min(650, max(200, round(800 * meta["height"] / meta["width"])))
+            canvas_width = round(canvas_height * meta["width"] / meta["height"])
+            bg = Image.fromarray(preview).resize((canvas_width, canvas_height))
+            names_text = st.text_area("Area names for drawn rectangles (one per line, in drawing order)",
+                                      value="Entrance\nAisle 1\nAisle 2\nCheckout Counter\nProduce\nDairy",
+                                      key="sf_area_names")
+            names = [ln.strip() for ln in names_text.splitlines() if ln.strip()]
+            canvas = st_canvas(fill_color="rgba(245, 185, 65, 0.15)", stroke_width=2, stroke_color="#a65a16",
+                               background_image=bg, update_streamlit=True, height=canvas_height,
+                               width=canvas_width, drawing_mode="rect", key="sf_area_canvas")
+            if st.button("Save drawn areas"):
+                objs = canvas.json_data.get("objects", []) if canvas.json_data else []
+                sx, sy = meta["width"] / canvas_width, meta["height"] / canvas_height
+                saved = []
+                for i, o in enumerate([o for o in objs if o.get("type") == "rect"]):
+                    if i >= len(names):
+                        break
+                    left, top = float(o.get("left", 0)), float(o.get("top", 0))
+                    w = float(o.get("width", 0)) * float(o.get("scaleX", 1))
+                    h = float(o.get("height", 0)) * float(o.get("scaleY", 1))
+                    saved.append({"name": names[i], "bounds": (
+                        max(0, left * sx), max(0, top * sy),
+                        min(meta["width"], (left + w) * sx), min(meta["height"], (top + h) * sy))})
+                st.session_state["sf_areas"] = saved
+                if saved:
+                    st.success(f"Saved {len(saved)} areas.")
+                else:
+                    st.warning("Draw at least one rectangle first.")
+
+        cur = st.session_state.get("sf_areas", [])
+        if cur:
+            edited = st.data_editor(pd.DataFrame({"Area": [a["name"] for a in cur]}),
+                                    hide_index=True, key=f"sf_rename_{len(cur)}")
+            st.session_state["sf_areas"] = [{**a, "name": n} for a, n in zip(cur, edited["Area"])]
+
+    areas = st.session_state.get("sf_areas", [])
+    if not areas:
+        st.info("No areas found yet. Draw and save areas above to see analytics.")
+        st.stop()
+    render(tracks, meta, areas, synthetic=False, background=st.session_state.get("sf_clean"))
